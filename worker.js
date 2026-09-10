@@ -1,25 +1,35 @@
 // @ts-nocheck
 /**
- * Cloudflare Worker —— 邮件/链接追踪器
- * 必需绑定：DB (D1 数据库)
- * 必需变量：ADMIN (文本，后台登录密码)
- * 可选变量：IPAPI_KEY (ipapi.is 的 Key，用于 IP 深度查询)
+ * Cloudflare Worker —— 邮件追踪器
+ * 绑定：DB (D1)
+ * 变量：ADMIN (必须，后台密码)；IPAPI_KEY (可选，ipapi.is Key)
  */
 
 const IMAGE_HOST = "https://tc.ilqx.dpdns.org";
 const IMAGE_UPLOAD_PATH = "/upload";
 
-const MAX_UPLOAD = 5 * 1024 * 1024; // 5MB
+const MAX_UPLOAD = 5 * 1024 * 1024;
 const ALLOWED_IMAGE = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp", "image/bmp"];
 const ALLOWED_VIDEO = ["video/mp4", "video/webm", "video/ogg", "video/quicktime"];
 
 const PIXEL_B64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
-// ---------- IP 查询 API Key（可通过环境变量 IPAPI_KEY 覆盖） ----------
 const DEFAULT_IPAPI_KEY = "91d0c00fdc50af8b1e84";
-
 function getIpapiKey(env) {
   return (env && env.IPAPI_KEY && String(env.IPAPI_KEY).trim()) || DEFAULT_IPAPI_KEY;
+}
+// 合法 IP 判断（IPv4 / IPv6 粗略）
+function isValidIp(ip) {
+  if (!ip) return false;
+  ip = String(ip).trim();
+  if (!ip || ip.toLowerCase() === "unknown") return false;
+  if (ip === "127.0.0.1" || ip === "::1") return false;
+  const v4 = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (v4.test(ip)) {
+    return ip.split(".").every(n => { const v = +n; return v >= 0 && v <= 255; });
+  }
+  if (ip.includes(":")) return /^[0-9a-fA-F:]+$/.test(ip);
+  return false;
 }
 
 export default {
@@ -27,7 +37,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // ---------- 环境变量校验 ----------
     if (!env || !env.ADMIN || typeof env.ADMIN !== "string" || !env.ADMIN.trim()) {
       return setupNotice();
     }
@@ -41,7 +50,6 @@ export default {
       return new Response("数据库初始化失败：" + (e && e.message ? e.message : e), { status: 500 });
     }
 
-    // ---------- 路由 ----------
     if (path === "/" || path === "/index.html") return renderHome(env);
     if (path.startsWith("/pixel/")) {
       const id = path.split("/")[2];
@@ -65,13 +73,8 @@ export default {
   }
 };
 
-/* =========================================================
- *  基础工具
- * =======================================================*/
-
-function notFound() {
-  return new Response("Not Found", { status: 404 });
-}
+/* ---------- 工具 ---------- */
+function notFound() { return new Response("Not Found", { status: 404 }); }
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -109,40 +112,30 @@ function transparentPixel() {
   });
 }
 
-/* ---------- 密码哈希（PBKDF2-SHA256） ---------- */
 async function hashPassword(password, salt) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
     { name: "PBKDF2", salt: enc.encode(salt), iterations: 100000, hash: "SHA-256" },
-    keyMaterial,
-    256
+    keyMaterial, 256
   );
   return Array.from(new Uint8Array(bits), b => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------- 文件魔数校验 ---------- */
 function matchMagic(bytes, sig, offset = 0) {
   if (bytes.length < offset + sig.length) return false;
-  for (let i = 0; i < sig.length; i++) {
-    if (bytes[offset + i] !== sig[i]) return false;
-  }
+  for (let i = 0; i < sig.length; i++) if (bytes[offset + i] !== sig[i]) return false;
   return true;
 }
 
 function validateFileBytes(mime, bytes) {
   mime = (mime || "").toLowerCase();
   if (mime === "image/jpg") mime = "image/jpeg";
-
   switch (mime) {
-    case "image/jpeg":
-      return matchMagic(bytes, [0xff, 0xd8, 0xff]);
-    case "image/png":
-      return matchMagic(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    case "image/gif":
-      return matchMagic(bytes, [0x47, 0x49, 0x46, 0x38]);
-    case "image/bmp":
-      return matchMagic(bytes, [0x42, 0x4d]);
+    case "image/jpeg": return matchMagic(bytes, [0xff, 0xd8, 0xff]);
+    case "image/png": return matchMagic(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    case "image/gif": return matchMagic(bytes, [0x47, 0x49, 0x46, 0x38]);
+    case "image/bmp": return matchMagic(bytes, [0x42, 0x4d]);
     case "image/webp":
       return bytes.length >= 12 &&
         matchMagic(bytes, [0x52, 0x49, 0x46, 0x46], 0) &&
@@ -150,45 +143,30 @@ function validateFileBytes(mime, bytes) {
     case "video/mp4":
     case "video/quicktime":
       return bytes.length >= 12 && matchMagic(bytes, [0x66, 0x74, 0x79, 0x70], 4);
-    case "video/webm":
-      return matchMagic(bytes, [0x1a, 0x45, 0xdf, 0xa3]);
-    case "video/ogg":
-      return matchMagic(bytes, [0x4f, 0x67, 0x67, 0x53]);
-    default:
-      return false;
+    case "video/webm": return matchMagic(bytes, [0x1a, 0x45, 0xdf, 0xa3]);
+    case "video/ogg": return matchMagic(bytes, [0x4f, 0x67, 0x67, 0x53]);
+    default: return false;
   }
 }
 
-/* ---------- 图床上传 ---------- */
 async function uploadToHost(blob, filename) {
   const fd = new FormData();
   fd.append("file", blob, filename);
   const resp = await fetch(IMAGE_HOST + IMAGE_UPLOAD_PATH, { method: "POST", body: fd });
   if (!resp.ok) throw new Error(`图床返回 HTTP ${resp.status}`);
   let result;
-  try {
-    result = await resp.json();
-  } catch {
-    throw new Error("图床返回内容无法解析");
-  }
+  try { result = await resp.json(); } catch { throw new Error("图床返回内容无法解析"); }
   if (Array.isArray(result) && result[0] && result[0].src) return IMAGE_HOST + result[0].src;
   if (result && result.data && result.data.url) return result.data.url;
   if (result && result.url) return result.url;
   throw new Error("图床返回格式异常");
 }
 
-/* =========================================================
- *  数据库
- * =======================================================*/
-
+/* ---------- DB ---------- */
 let initPromise = null;
-
 function initDB(env) {
   if (!initPromise) {
-    initPromise = doInitDB(env).catch(err => {
-      initPromise = null;
-      throw err;
-    });
+    initPromise = doInitDB(env).catch(err => { initPromise = null; throw err; });
   }
   return initPromise;
 }
@@ -196,89 +174,47 @@ function initDB(env) {
 async function doInitDB(env) {
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS targets (
-      id TEXT PRIMARY KEY,
-      pass_hash TEXT,
-      pass_salt TEXT,
-      image_type TEXT DEFAULT 'default',
-      image_url TEXT,
-      creator_ip TEXT,
-      creator_ua TEXT,
-      creator_webrtc_ips TEXT,
-      creator_fingerprint TEXT,
+      id TEXT PRIMARY KEY, pass_hash TEXT, pass_salt TEXT,
+      image_type TEXT DEFAULT 'default', image_url TEXT,
+      creator_ip TEXT, creator_ua TEXT, creator_webrtc_ips TEXT, creator_fingerprint TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
+    )`).run();
 
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS tracking_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      target_id TEXT NOT NULL,
-      event_type TEXT NOT NULL DEFAULT 'open',
-      ip TEXT,
-      country TEXT,
-      country_code TEXT,
-      region TEXT,
-      city TEXT,
-      timezone TEXT,
-      isp TEXT,
-      org TEXT,
-      as_text TEXT,
-      lat REAL,
-      lon REAL,
-      ua TEXT,
-      languages TEXT,
-      referer TEXT,
-      accept TEXT,
-      accept_encoding TEXT,
-      sec_ch_ua TEXT,
-      sec_ch_ua_platform TEXT,
-      sec_ch_ua_mobile TEXT,
+      id INTEGER PRIMARY KEY AUTOINCREMENT, target_id TEXT NOT NULL,
+      event_type TEXT NOT NULL DEFAULT 'open', ip TEXT,
+      country TEXT, country_code TEXT, region TEXT, city TEXT, timezone TEXT,
+      isp TEXT, org TEXT, as_text TEXT, lat REAL, lon REAL,
+      ua TEXT, languages TEXT, referer TEXT, accept TEXT, accept_encoding TEXT,
+      sec_ch_ua TEXT, sec_ch_ua_platform TEXT, sec_ch_ua_mobile TEXT,
       opened_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
+    )`).run();
 
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS admin_sessions (
       token TEXT PRIMARY KEY,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       expires_at DATETIME
-    )
-  `).run();
+    )`).run();
 
-  const targetCols = [
-    "pass_hash", "pass_salt", "image_type", "image_url",
-    "creator_ip", "creator_ua", "creator_webrtc_ips", "creator_fingerprint"
-  ];
-  for (const col of targetCols) {
-    try { await env.DB.prepare(`ALTER TABLE targets ADD COLUMN ${col} TEXT`).run(); } catch (e) {}
-  }
+  const targetCols = ["pass_hash","pass_salt","image_type","image_url","creator_ip","creator_ua","creator_webrtc_ips","creator_fingerprint"];
+  for (const col of targetCols) { try { await env.DB.prepare(`ALTER TABLE targets ADD COLUMN ${col} TEXT`).run(); } catch (e) {} }
 
-  const logCols = [
-    "country_code", "region", "city", "timezone", "isp", "org", "as_text",
-    "referer", "accept", "accept_encoding", "sec_ch_ua", "sec_ch_ua_platform", "sec_ch_ua_mobile"
-  ];
-  for (const col of logCols) {
-    try { await env.DB.prepare(`ALTER TABLE tracking_logs ADD COLUMN ${col} TEXT`).run(); } catch (e) {}
-  }
+  const logCols = ["country_code","region","city","timezone","isp","org","as_text","referer","accept","accept_encoding","sec_ch_ua","sec_ch_ua_platform","sec_ch_ua_mobile"];
+  for (const col of logCols) { try { await env.DB.prepare(`ALTER TABLE tracking_logs ADD COLUMN ${col} TEXT`).run(); } catch (e) {} }
   try { await env.DB.prepare(`ALTER TABLE tracking_logs ADD COLUMN lat REAL`).run(); } catch (e) {}
   try { await env.DB.prepare(`ALTER TABLE tracking_logs ADD COLUMN lon REAL`).run(); } catch (e) {}
 }
 
-/* =========================================================
- *  追踪像素 / 媒体
- * =======================================================*/
-
+/* ---------- 追踪像素 ---------- */
 async function handlePixel(request, env, ctx, targetId) {
-  const target = await env.DB.prepare(
-    "SELECT image_type, image_url FROM targets WHERE id = ?"
-  ).bind(targetId).first();
-
+  const target = await env.DB.prepare("SELECT image_type, image_url FROM targets WHERE id = ?").bind(targetId).first();
   if (!target) return transparentPixel();
 
   const cf = request.cf || {};
   const ip = request.headers.get("CF-Connecting-IP") || "Unknown";
   const ua = request.headers.get("User-Agent") || "";
-
   const lat = cf.latitude ? parseFloat(cf.latitude) : null;
   const lon = cf.longitude ? parseFloat(cf.longitude) : null;
 
@@ -290,18 +226,10 @@ async function handlePixel(request, env, ctx, targetId) {
         sec_ch_ua, sec_ch_ua_platform, sec_ch_ua_mobile
       ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
-      targetId,
-      ip,
-      cf.country || "",
-      cf.country || "",
-      cf.region || "",
-      cf.city || "",
-      cf.timezone || "",
-      cf.asOrganization || "",
-      cf.asOrganization || "",
-      cf.asn ? ("AS" + cf.asn) : "",
-      Number.isFinite(lat) ? lat : null,
-      Number.isFinite(lon) ? lon : null,
+      targetId, ip,
+      cf.country || "", cf.country || "", cf.region || "", cf.city || "", cf.timezone || "",
+      cf.asOrganization || "", cf.asOrganization || "", cf.asn ? ("AS" + cf.asn) : "",
+      Number.isFinite(lat) ? lat : null, Number.isFinite(lon) ? lon : null,
       ua,
       request.headers.get("Accept-Language") || "",
       request.headers.get("Referer") || "",
@@ -311,19 +239,15 @@ async function handlePixel(request, env, ctx, targetId) {
       request.headers.get("Sec-Ch-Ua-Platform") || "",
       request.headers.get("Sec-Ch-Ua-Mobile") || ""
     ).run();
-  } catch (e) {
-    // 日志失败不影响媒体返回
-  }
+  } catch (e) {}
 
   const type = target.image_type || "default";
   const mediaUrl = target.image_url || "";
-
   if (type === "default" || !mediaUrl) return transparentPixel();
 
   try {
     const upstream = await fetch(mediaUrl, { cf: { cacheTtl: 0 } });
     if (!upstream.ok) return transparentPixel();
-
     const headers = new Headers();
     const ct = upstream.headers.get("Content-Type");
     headers.set("Content-Type", ct || (type === "video" ? "video/mp4" : "image/jpeg"));
@@ -331,28 +255,16 @@ async function handlePixel(request, env, ctx, targetId) {
     headers.set("Pragma", "no-cache");
     headers.set("Expires", "0");
     headers.set("Cross-Origin-Resource-Policy", "cross-origin");
-    if (upstream.headers.get("Content-Length")) {
-      headers.set("Content-Length", upstream.headers.get("Content-Length"));
-    }
+    if (upstream.headers.get("Content-Length")) headers.set("Content-Length", upstream.headers.get("Content-Length"));
     return new Response(upstream.body, { headers });
-  } catch (e) {
-    return transparentPixel();
-  }
+  } catch (e) { return transparentPixel(); }
 }
 
-/* =========================================================
- *  生成追踪
- * =======================================================*/
-
+/* ---------- 生成 ---------- */
 async function handleGenerate(request, env) {
   if (request.method !== "POST") return jsonResponse({ error: "请求方式错误" }, 405);
-
   let formData;
-  try {
-    formData = await request.formData();
-  } catch {
-    return jsonResponse({ error: "表单格式错误" }, 400);
-  }
+  try { formData = await request.formData(); } catch { return jsonResponse({ error: "表单格式错误" }, 400); }
 
   const customId = String(formData.get("customId") || "").trim();
   const password = String(formData.get("password") || "");
@@ -364,69 +276,40 @@ async function handleGenerate(request, env) {
   const creatorIp = request.headers.get("CF-Connecting-IP") || "Unknown";
   const creatorUa = request.headers.get("User-Agent") || "";
 
-  if (!/^[A-Za-z0-9_-]{4,32}$/.test(customId)) {
-    return jsonResponse({ error: "追踪 ID 需为 4–32 位字母、数字、下划线或短横线" }, 400);
-  }
-  if (password.length < 4 || password.length > 64) {
-    return jsonResponse({ error: "访问密码长度需为 4–64 位" }, 400);
-  }
+  if (!/^[A-Za-z0-9_-]{4,32}$/.test(customId)) return jsonResponse({ error: "追踪 ID 需为 4–32 位字母、数字、下划线或短横线" }, 400);
+  if (password.length < 4 || password.length > 64) return jsonResponse({ error: "访问密码长度需为 4–64 位" }, 400);
 
   const existing = await env.DB.prepare("SELECT id FROM targets WHERE id = ?").bind(customId).first();
   if (existing) return jsonResponse({ error: "该追踪 ID 已被占用，请更换" }, 400);
 
-  let finalType = "default";
-  let finalUrl = "";
+  let finalType = "default", finalUrl = "";
 
   if (mediaType === "default") {
     finalType = "default";
   } else if (mediaType === "image-url" || mediaType === "video-url") {
-    if (!/^https?:\/\/.+/i.test(imageUrl)) {
-      return jsonResponse({ error: "请填写有效的 http(s) 链接" }, 400);
-    }
-    if (imageUrl.length > 2048) {
-      return jsonResponse({ error: "链接过长" }, 400);
-    }
+    if (!/^https?:\/\/.+/i.test(imageUrl)) return jsonResponse({ error: "请填写有效的 http(s) 链接" }, 400);
+    if (imageUrl.length > 2048) return jsonResponse({ error: "链接过长" }, 400);
     finalType = mediaType === "image-url" ? "image" : "video";
     finalUrl = imageUrl;
   } else if (mediaType === "image-upload" || mediaType === "video-upload") {
-    if (!file || typeof file === "string" || typeof file.size !== "number") {
-      return jsonResponse({ error: "请选择要上传的文件" }, 400);
-    }
+    if (!file || typeof file === "string" || typeof file.size !== "number") return jsonResponse({ error: "请选择要上传的文件" }, 400);
     if (file.size === 0) return jsonResponse({ error: "文件为空" }, 400);
-    if (file.size > MAX_UPLOAD) {
-      return jsonResponse({ error: "文件超过 5MB 限制，请压缩后再上传" }, 400);
-    }
-
+    if (file.size > MAX_UPLOAD) return jsonResponse({ error: "文件超过 5MB 限制，请压缩后再上传" }, 400);
     let mime = (file.type || "").toLowerCase();
     if (mime === "image/jpg") mime = "image/jpeg";
-
     const isVideo = mediaType === "video-upload";
     const allowList = isVideo ? ALLOWED_VIDEO : ALLOWED_IMAGE;
-
     if (!allowList.includes(mime)) {
-      return jsonResponse({
-        error: isVideo
-          ? "仅支持 MP4 / WebM / OGG / MOV 视频格式"
-          : "仅支持 JPG / PNG / GIF / WebP / BMP 图片格式"
-      }, 400);
+      return jsonResponse({ error: isVideo ? "仅支持 MP4 / WebM / OGG / MOV 视频格式" : "仅支持 JPG / PNG / GIF / WebP / BMP 图片格式" }, 400);
     }
-
     const bytes = new Uint8Array(await file.arrayBuffer());
-    if (!validateFileBytes(mime, bytes)) {
-      return jsonResponse({ error: "文件内容与声明的格式不符，已拒绝" }, 400);
-    }
-
-    const fallbackName = (file.name && /^[\w\-. ]+$/.test(file.name))
-      ? file.name
-      : (isVideo ? "video.mp4" : "image.jpg");
-
+    if (!validateFileBytes(mime, bytes)) return jsonResponse({ error: "文件内容与声明的格式不符，已拒绝" }, 400);
+    const fallbackName = (file.name && /^[\w\-. ]+$/.test(file.name)) ? file.name : (isVideo ? "video.mp4" : "image.jpg");
     try {
       const blob = new Blob([bytes], { type: mime });
       finalUrl = await uploadToHost(blob, fallbackName);
       finalType = isVideo ? "video" : "image";
-    } catch (e) {
-      return jsonResponse({ error: "上传失败：" + (e && e.message ? e.message : e) }, 502);
-    }
+    } catch (e) { return jsonResponse({ error: "上传失败：" + (e && e.message ? e.message : e) }, 502); }
   } else {
     return jsonResponse({ error: "未知的媒体类型" }, 400);
   }
@@ -436,50 +319,27 @@ async function handleGenerate(request, env) {
 
   const origin = new URL(request.url).origin;
   let snippet;
-  if (finalType === "default") {
-    snippet = `<img src="${origin}/pixel/${customId}" width="1" height="1" alt="" style="display:none!important;border:0;outline:none;" />`;
-  } else if (finalType === "image") {
-    snippet = `<img src="${origin}/pixel/${customId}" alt="" style="max-width:100%;height:auto;border-radius:10px;" />`;
-  } else {
-    snippet = `<video src="${origin}/pixel/${customId}" controls playsinline preload="metadata" style="max-width:100%;border-radius:10px;"></video>`;
-  }
+  if (finalType === "default") snippet = `<img src="${origin}/pixel/${customId}" width="1" height="1" alt="" style="display:none!important;border:0;outline:none;" />`;
+  else if (finalType === "image") snippet = `<img src="${origin}/pixel/${customId}" alt="" style="max-width:100%;height:auto;border-radius:10px;" />`;
+  else snippet = `<video src="${origin}/pixel/${customId}" controls playsinline preload="metadata" style="max-width:100%;border-radius:10px;"></video>`;
 
   await env.DB.prepare(`
     INSERT INTO targets (id, pass_hash, pass_salt, image_type, image_url,
       creator_ip, creator_ua, creator_webrtc_ips, creator_fingerprint)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    customId, passHash, salt, finalType, finalUrl,
-    creatorIp, creatorUa, webrtcIps, fingerprint
-  ).run();
+  `).bind(customId, passHash, salt, finalType, finalUrl, creatorIp, creatorUa, webrtcIps, fingerprint).run();
 
-  return jsonResponse({
-    id: customId,
-    mediaType: finalType,
-    trackingHtml: snippet
-  });
+  return jsonResponse({ id: customId, mediaType: finalType, trackingHtml: snippet });
 }
 
-/* =========================================================
- *  查询 / 统计
- * =======================================================*/
-
+/* ---------- 查询 / 统计 ---------- */
 async function verifyTargetPassword(env, id, password) {
   if (!id || !password) return { ok: false, code: 400, error: "缺少参数" };
-
-  const target = await env.DB.prepare(
-    "SELECT * FROM targets WHERE id = ?"
-  ).bind(id).first();
-
+  const target = await env.DB.prepare("SELECT * FROM targets WHERE id = ?").bind(id).first();
   if (!target) return { ok: false, code: 404, error: "追踪 ID 不存在" };
-  if (!target.pass_hash || !target.pass_salt) {
-    return { ok: false, code: 403, error: "该记录无访问密码，无法查询" };
-  }
-
+  if (!target.pass_hash || !target.pass_salt) return { ok: false, code: 403, error: "该记录无访问密码，无法查询" };
   const hash = await hashPassword(password, target.pass_salt);
-  if (hash !== target.pass_hash) {
-    return { ok: false, code: 401, error: "访问密码错误" };
-  }
+  if (hash !== target.pass_hash) return { ok: false, code: 401, error: "访问密码错误" };
   return { ok: true, target };
 }
 
@@ -494,12 +354,13 @@ async function handleQuery(request, env) {
 
   const target = check.target;
 
+  // 关键修复：把创建者 IP 全部加入集合（包括 Unknown），用于标记「本地」
   const creatorIpSet = new Set();
-  if (target.creator_ip && target.creator_ip !== "Unknown") creatorIpSet.add(target.creator_ip);
+  if (target.creator_ip) creatorIpSet.add(String(target.creator_ip).trim());
   if (target.creator_webrtc_ips) {
     try {
       const arr = JSON.parse(target.creator_webrtc_ips);
-      if (Array.isArray(arr)) arr.forEach(ip => ip && creatorIpSet.add(ip));
+      if (Array.isArray(arr)) arr.forEach(ip => { if (ip) creatorIpSet.add(String(ip).trim()); });
     } catch (e) {}
   }
 
@@ -507,15 +368,12 @@ async function handleQuery(request, env) {
     SELECT id, target_id, event_type, ip, country, country_code, region, city, timezone,
            isp, org, as_text, lat, lon, ua, languages, referer, accept, accept_encoding,
            sec_ch_ua, sec_ch_ua_platform, sec_ch_ua_mobile, opened_at
-    FROM tracking_logs
-    WHERE target_id = ?
-    ORDER BY opened_at DESC
-    LIMIT 500
+    FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 500
   `).bind(id).all();
 
   const results = logs.results.map(log => ({
     ...log,
-    is_local: creatorIpSet.has(log.ip)
+    is_local: creatorIpSet.has(String(log.ip || "").trim())
   }));
 
   if (burn && results.length > 0) {
@@ -535,19 +393,12 @@ async function handleStats(request, env) {
   const u = new URL(request.url);
   const id = (u.searchParams.get("id") || "").trim();
   const password = u.searchParams.get("password") || "";
-
   const check = await verifyTargetPassword(env, id, password);
   if (!check.ok) return jsonResponse({ error: check.error }, check.code);
 
-  const total = await env.DB.prepare(
-    "SELECT COUNT(*) AS c FROM tracking_logs WHERE target_id = ?"
-  ).bind(id).first();
-  const uniqueIp = await env.DB.prepare(
-    "SELECT COUNT(DISTINCT ip) AS c FROM tracking_logs WHERE target_id = ?"
-  ).bind(id).first();
-  const latest = await env.DB.prepare(
-    "SELECT opened_at FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 1"
-  ).bind(id).first();
+  const total = await env.DB.prepare("SELECT COUNT(*) AS c FROM tracking_logs WHERE target_id = ?").bind(id).first();
+  const uniqueIp = await env.DB.prepare("SELECT COUNT(DISTINCT ip) AS c FROM tracking_logs WHERE target_id = ?").bind(id).first();
+  const latest = await env.DB.prepare("SELECT opened_at FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 1").bind(id).first();
 
   return jsonResponse({
     total: total ? total.c : 0,
@@ -556,70 +407,58 @@ async function handleStats(request, env) {
   });
 }
 
-/* =========================================================
- *  IP 详情（服务端代理备用；前端已改用直连 ipapi.is）
- * =======================================================*/
-
+/* ---------- IP 详情（服务端代理，处理 Unknown） ---------- */
 async function handleIpLookup(request, env) {
   const u = new URL(request.url);
   const ip = (u.searchParams.get("ip") || "").trim();
   if (!ip) return jsonResponse({ error: "缺少 IP 参数" }, 400);
   if (ip.length > 64) return jsonResponse({ error: "IP 参数异常" }, 400);
+  if (!isValidIp(ip)) {
+    return jsonResponse({ error: "该 IP 无法查询（可能为 Unknown 或私有地址）" }, 200);
+  }
 
   const key = getIpapiKey(env);
-
   try {
-    const resp = await fetch(
-      `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`,
-      { cf: { cacheTtl: 300 } }
-    );
+    const resp = await fetch(`https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`, {
+      cf: { cacheTtl: 300 }
+    });
     if (!resp.ok) {
-      return jsonResponse({ error: `上游返回 HTTP ${resp.status}` }, 502);
+      if (resp.status === 404) return jsonResponse({ error: "上游未收录该 IP" }, 200);
+      return jsonResponse({ error: `上游返回 HTTP ${resp.status}` }, 200);
     }
     const data = await resp.json();
     return jsonResponse(data);
   } catch (e) {
-    return jsonResponse({ error: "查询异常：" + (e && e.message ? e.message : e) }, 502);
+    return jsonResponse({ error: "查询异常：" + (e && e.message ? e.message : e) }, 200);
   }
 }
 
-/* =========================================================
- *  后台会话
- * =======================================================*/
-
+/* ---------- 会话 ---------- */
 async function isAdmin(request, env) {
   const token = getCookie(request, "admin_token");
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return false;
-  const row = await env.DB.prepare(
-    "SELECT token FROM admin_sessions WHERE token = ? AND expires_at > datetime('now')"
-  ).bind(token).first();
+  const row = await env.DB.prepare("SELECT token FROM admin_sessions WHERE token = ? AND expires_at > datetime('now')").bind(token).first();
   return !!row;
 }
 
 async function handleAdminLogin(request, env) {
   if (request.method !== "POST") return jsonResponse({ error: "请求方式错误" }, 405);
-
   let body;
-  try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "请求体格式错误" }, 400);
-  }
+  try { body = await request.json(); } catch { return jsonResponse({ error: "请求体格式错误" }, 400); }
 
   const password = String(body.password || "");
   if (!password) return jsonResponse({ error: "请输入密码" }, 400);
 
-  if (password !== env.ADMIN) {
-    await new Promise(r => setTimeout(r, 600));
+  // 关键修复：两端都 trim，避免环境变量带空白导致永远登录失败
+  const expected = String(env.ADMIN || "").trim();
+  if (password.trim() !== expected) {
+    await new Promise(r => setTimeout(r, 500));
     return jsonResponse({ error: "密码错误" }, 401);
   }
 
   await env.DB.prepare("DELETE FROM admin_sessions").run();
-
   const token = randomHex(32);
-  await env.DB.prepare(
-    "INSERT INTO admin_sessions (token, expires_at) VALUES (?, datetime('now','+1 day'))"
-  ).bind(token).run();
+  await env.DB.prepare("INSERT INTO admin_sessions (token, expires_at) VALUES (?, datetime('now','+1 day'))").bind(token).run();
 
   return jsonResponse({ success: true }, 200, {
     "Set-Cookie": `admin_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`
@@ -629,34 +468,24 @@ async function handleAdminLogin(request, env) {
 async function handleAdminLogout(request, env) {
   if (request.method !== "POST") return jsonResponse({ error: "请求方式错误" }, 405);
   const token = getCookie(request, "admin_token");
-  if (token) {
-    await env.DB.prepare("DELETE FROM admin_sessions WHERE token = ?").bind(token).run();
-  }
+  if (token) await env.DB.prepare("DELETE FROM admin_sessions WHERE token = ?").bind(token).run();
   return jsonResponse({ success: true }, 200, {
     "Set-Cookie": "admin_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
   });
 }
 
-/* =========================================================
- *  后台操作
- * =======================================================*/
-
+/* ---------- 后台操作 ---------- */
 async function requireAdmin(request, env) {
-  if (!await isAdmin(request, env)) {
-    return jsonResponse({ error: "未登录或登录已失效" }, 401);
-  }
+  if (!await isAdmin(request, env)) return jsonResponse({ error: "未登录或登录已失效" }, 401);
   return null;
 }
 
 async function handleAdminDelete(request, env) {
   const denied = await requireAdmin(request, env);
   if (denied) return denied;
-
-  let body;
-  try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
+  let body; try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
   const id = parseInt(body.id, 10);
   if (!Number.isFinite(id)) return jsonResponse({ error: "无效 ID" }, 400);
-
   await env.DB.prepare("DELETE FROM tracking_logs WHERE id = ?").bind(id).run();
   return jsonResponse({ success: true });
 }
@@ -671,12 +500,9 @@ async function handleAdminClear(request, env) {
 async function handleAdminDeleteTarget(request, env) {
   const denied = await requireAdmin(request, env);
   if (denied) return denied;
-
-  let body;
-  try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
+  let body; try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
   const id = String(body.id || "");
   if (!id) return jsonResponse({ error: "无效 ID" }, 400);
-
   await env.DB.batch([
     env.DB.prepare("DELETE FROM tracking_logs WHERE target_id = ?").bind(id),
     env.DB.prepare("DELETE FROM targets WHERE id = ?").bind(id)
@@ -687,13 +513,10 @@ async function handleAdminDeleteTarget(request, env) {
 async function handleAdminDeleteTargets(request, env) {
   const denied = await requireAdmin(request, env);
   if (denied) return denied;
-
-  let body;
-  try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
+  let body; try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
   const ids = body.ids;
   if (!Array.isArray(ids) || ids.length === 0) return jsonResponse({ error: "未选择任何 ID" }, 400);
   if (ids.length > 200) return jsonResponse({ error: "单次最多删除 200 条" }, 400);
-
   const stmts = [];
   for (const id of ids) {
     stmts.push(env.DB.prepare("DELETE FROM tracking_logs WHERE target_id = ?").bind(String(id)));
@@ -713,27 +536,17 @@ async function handleAdminClearTargets(request, env) {
   return jsonResponse({ success: true });
 }
 
-/* =========================================================
- *  地图瓦片反代
- * =======================================================*/
-
+/* ---------- 瓦片 ---------- */
 async function handleTile(request) {
   const url = new URL(request.url);
   const parts = url.pathname.split("/");
   const z = parts[2], x = parts[3], y = parts[4].split(".")[0];
-
-  if (!/^\d+$/.test(z) || !/^\d+$/.test(x) || !/^\d+$/.test(y)) {
-    return new Response("Bad tile", { status: 400 });
-  }
+  if (!/^\d+$/.test(z) || !/^\d+$/.test(x) || !/^\d+$/.test(y)) return new Response("Bad tile", { status: 400 });
 
   const upstream = await fetch(`https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`, {
-    headers: {
-      "Referer": url.origin,
-      "User-Agent": "Mozilla/5.0 (compatible; TrackerTileProxy/1.0)"
-    },
+    headers: { "Referer": url.origin, "User-Agent": "Mozilla/5.0 (compatible; TrackerTileProxy/1.0)" },
     cf: { cacheTtl: 86400, cacheEverything: true }
   });
-
   const headers = new Headers();
   headers.set("Content-Type", upstream.headers.get("Content-Type") || "image/png");
   headers.set("Access-Control-Allow-Origin", "*");
@@ -741,61 +554,28 @@ async function handleTile(request) {
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-/* =========================================================
- *  配置缺失提示页
- * =======================================================*/
-
+/* ---------- 配置提示 ---------- */
 function setupNotice() {
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>配置未完成</title>
-<style>
-  *{box-sizing:border-box}
-  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
-       font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-       background:#0b1120;color:#e2e8f0}
-  .box{max-width:560px;width:100%;background:#111a2e;border:1px solid #1e293b;border-radius:18px;padding:32px}
-  .tag{display:inline-block;font-size:12px;letter-spacing:.5px;color:#fca5a5;background:rgba(248,113,113,.12);
-       border:1px solid rgba(248,113,113,.3);padding:3px 10px;border-radius:999px;margin-bottom:14px}
-  h1{margin:0 0 10px;font-size:20px;color:#f1f5f9}
-  p{margin:10px 0;font-size:14px;line-height:1.8;color:#94a3b8}
-  code{background:#0b1120;border:1px solid #1e293b;padding:2px 7px;border-radius:6px;color:#7dd3fc;font-size:13px;font-family:ui-monospace,Menlo,monospace}
-  ul{margin:10px 0 0;padding-left:20px;color:#94a3b8;font-size:14px;line-height:1.9}
-  .foot{margin-top:22px;padding-top:16px;border-top:1px solid #1e293b;font-size:12px;color:#64748b}
-</style>
-</head>
-<body>
-  <div class="box">
-    <span class="tag">DEPLOY INCOMPLETE</span>
-    <h1>服务尚未配置完成</h1>
-    <p>这个 Worker 需要在 Cloudflare 后台补上环境变量才能运行：</p>
-    <ul>
-      <li><code>ADMIN</code>（文本，<b>必须</b>）— 后台登录密码</li>
-      <li><code>IPAPI_KEY</code>（文本，可选）— ipapi.is 的 Key，用于 IP 深度查询</li>
-      <li>D1 数据库绑定变量名需为 <code>DB</code></li>
-    </ul>
-    <p>配置路径：Workers &amp; Pages → 你的 Worker → Settings → Variables and Secrets。</p>
-    <p>配置完成后刷新本页即可正常使用。</p>
-    <div class="foot">Copyright © 2026 SAK All rights reserved.</div>
-  </div>
-</body>
-</html>`;
-  return new Response(html, {
-    status: 503,
-    headers: { "Content-Type": "text/html; charset=utf-8" }
-  });
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>配置未完成</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:#0b1120;color:#e2e8f0}
+.box{max-width:560px;width:100%;background:#111a2e;border:1px solid #1e293b;border-radius:18px;padding:32px}
+.tag{display:inline-block;font-size:12px;letter-spacing:.5px;color:#fca5a5;background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.3);padding:3px 10px;border-radius:999px;margin-bottom:14px}
+h1{margin:0 0 10px;font-size:20px;color:#f1f5f9}p{margin:10px 0;font-size:14px;line-height:1.8;color:#94a3b8}
+code{background:#0b1120;border:1px solid #1e293b;padding:2px 7px;border-radius:6px;color:#7dd3fc;font-size:13px;font-family:ui-monospace,Menlo,monospace}
+ul{margin:10px 0 0;padding-left:20px;color:#94a3b8;font-size:14px;line-height:1.9}.foot{margin-top:22px;padding-top:16px;border-top:1px solid #1e293b;font-size:12px;color:#64748b}</style></head>
+<body><div class="box"><span class="tag">DEPLOY INCOMPLETE</span><h1>服务尚未配置完成</h1>
+<p>这个 Worker 需要在 Cloudflare 后台补上环境变量才能运行：</p>
+<ul><li><code>ADMIN</code>（文本，<b>必须</b>）— 后台登录密码</li><li><code>IPAPI_KEY</code>（文本，可选）— ipapi.is 的 Key</li><li>D1 数据库绑定变量名需为 <code>DB</code></li></ul>
+<p>配置路径：Workers &amp; Pages → 你的 Worker → Settings → Variables and Secrets。</p>
+<p>配置完成后刷新本页即可正常使用。</p>
+<div class="foot">Copyright © 2026 SAK All rights reserved.</div></div></body></html>`;
+  return new Response(html, { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 /* =========================================================
  *  首页
  * =======================================================*/
-
 function renderHome(env) {
-  const ipapiKey = getIpapiKey(env);
-
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -809,48 +589,32 @@ function renderHome(env) {
 <script src="https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@3/dist/fp.min.js"><\/script>
 <style>
   *{-webkit-tap-highlight-color:transparent}
-  body{
-    margin:0;
-    font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-    background:radial-gradient(1200px 600px at 50% -10%,#e8edff 0%,#f6f8fc 45%,#f1f5f9 100%);
-    min-height:100vh;color:#0f172a;
-  }
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:radial-gradient(1200px 600px at 50% -10%,#e8edff 0%,#f6f8fc 45%,#f1f5f9 100%);min-height:100vh;color:#0f172a}
   .card{background:#fff;border:1px solid #e9edf5;border-radius:20px;box-shadow:0 6px 28px -12px rgba(15,23,42,.14)}
-  .fld{width:100%;border:1px solid #dfe5f0;border-radius:12px;padding:10px 13px;font-size:14px;outline:none;
-       background:#fbfcfe;transition:.18s}
+  .fld{width:100%;border:1px solid #dfe5f0;border-radius:12px;padding:10px 13px;font-size:14px;outline:none;background:#fbfcfe;transition:.18s}
   .fld:focus{border-color:#6366f1;background:#fff;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
   .lbl{font-size:12.5px;font-weight:600;color:#475569;margin-bottom:6px;display:block}
-  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-weight:600;font-size:14px;
-       border-radius:12px;padding:10px 20px;border:none;cursor:pointer;transition:.16s}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font-weight:600;font-size:14px;border-radius:12px;padding:10px 20px;border:none;cursor:pointer;transition:.16s}
   .btn:active{transform:translateY(1px)}
-  .btn-primary{background:#4f46e5;color:#fff}
-  .btn-primary:hover{background:#4338ca}
-  .btn-ghost{background:#eef2ff;color:#4338ca}
-  .btn-ghost:hover{background:#e0e7ff}
-  .btn-soft{background:#ecfdf5;color:#047857}
-  .btn-soft:hover{background:#d1fae5}
+  .btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}
+  .btn-ghost{background:#eef2ff;color:#4338ca}.btn-ghost:hover{background:#e0e7ff}
+  .btn-soft{background:#ecfdf5;color:#047857}.btn-soft:hover{background:#d1fae5}
   .btn:disabled{opacity:.55;cursor:not-allowed}
   .tabbar{display:inline-flex;background:#eef2f8;border-radius:12px;padding:3px;gap:3px}
-  .tabbar button{border:none;background:transparent;font-size:13.5px;font-weight:600;color:#64748b;
-                 padding:7px 18px;border-radius:9px;cursor:pointer;transition:.16s}
+  .tabbar button{border:none;background:transparent;font-size:13.5px;font-weight:600;color:#64748b;padding:7px 18px;border-radius:9px;cursor:pointer;transition:.16s}
   .tabbar button.on{background:#fff;color:#4338ca;box-shadow:0 1px 5px rgba(15,23,42,.1)}
-  .opt{display:flex;align-items:center;gap:8px;font-size:13.5px;color:#334155;padding:9px 13px;border:1px solid #e6ebf3;
-       border-radius:11px;cursor:pointer;transition:.15s;background:#fbfcfe}
+  .opt{display:flex;align-items:center;gap:8px;font-size:13.5px;color:#334155;padding:9px 13px;border:1px solid #e6ebf3;border-radius:11px;cursor:pointer;transition:.15s;background:#fbfcfe}
   .opt:hover{border-color:#c7d2fe;background:#f8faff}
-  .opt input{accent-color:#4f46e5;margin:0}
-  .opt.on{border-color:#a5b4fc;background:#eef2ff}
-  .ip-addr{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-           word-break:break-all;overflow-wrap:anywhere;line-height:1.45}
-  .local-badge{background:#fef3c7;color:#92400e;padding:1px 8px;border-radius:999px;font-size:10.5px;font-weight:700;
-               white-space:nowrap}
+  .opt input{accent-color:#4f46e5;margin:0}.opt.on{border-color:#a5b4fc;background:#eef2ff}
+  .ip-addr{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;overflow-wrap:anywhere;line-height:1.45}
+  .local-badge{background:#fef3c7;color:#92400e;padding:1px 8px;border-radius:999px;font-size:10.5px;font-weight:700;white-space:nowrap}
   .flag{width:20px;height:14px;border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.18);vertical-align:-1px}
   .tl{position:relative;padding-left:20px}
   .tl::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:#e6ebf3;border-radius:2px}
   .tl-item{position:relative;padding:7px 0}
-  .tl-item::before{content:"";position:absolute;left:-19px;top:14px;width:8px;height:8px;border-radius:50%;
-                   background:#6366f1;box-shadow:0 0 0 2.5px #fff}
-  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;
-         align-items:center;justify-content:center;padding:14px;z-index:90}
+  .tl-item::before{content:"";position:absolute;left:-19px;top:14px;width:8px;height:8px;border-radius:50%;background:#6366f1;box-shadow:0 0 0 2.5px #fff}
+  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:90}
   .modal.on{display:flex}
   .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto}
   .dgrid{display:grid;grid-template-columns:1fr;gap:0}
@@ -866,7 +630,6 @@ function renderHome(env) {
 <body>
 <div class="max-w-3xl mx-auto px-4 py-8 sm:py-12 space-y-5">
 
-  <!-- 生成卡片 -->
   <div class="card p-5 sm:p-7">
     <div class="flex items-center gap-2 mb-1">
       <i class="fa-solid fa-envelope-open-text text-indigo-600"></i>
@@ -901,14 +664,12 @@ function renderHome(env) {
       </div>
     </div>
 
-    <!-- 图片选项 -->
     <div id="imageOpts" class="mt-3 space-y-2">
       <label class="opt on"><input type="radio" name="imageMode" value="default" checked> 默认 1×1 像素（隐藏，最不易被察觉）</label>
       <label class="opt"><input type="radio" name="imageMode" value="url"> 自定义图片 URL</label>
       <label class="opt"><input type="radio" name="imageMode" value="upload"> 上传图片（推荐）</label>
     </div>
 
-    <!-- 视频选项 -->
     <div id="videoOpts" class="mt-3 space-y-2 hidden">
       <label class="opt on"><input type="radio" name="videoMode" value="upload" checked> 上传视频（推荐）</label>
       <label class="opt"><input type="radio" name="videoMode" value="url"> 自定义视频 URL</label>
@@ -940,14 +701,11 @@ function renderHome(env) {
         </div>
         <textarea id="codeOut" readonly rows="3"
           class="w-full text-[12px] font-mono bg-white border border-indigo-100 rounded-xl p-3 resize-none outline-none"></textarea>
-        <p class="text-[11.5px] text-slate-500 mt-2">
-          请妥善保管追踪 ID 与访问密码，丢失后无法找回记录。
-        </p>
+        <p class="text-[11.5px] text-slate-500 mt-2">请妥善保管追踪 ID 与访问密码，丢失后无法找回记录。</p>
       </div>
     </div>
   </div>
 
-  <!-- 查询卡片 -->
   <div class="card p-5 sm:p-7">
     <div class="flex items-center gap-2 mb-5">
       <i class="fa-solid fa-magnifying-glass text-emerald-600"></i>
@@ -975,7 +733,6 @@ function renderHome(env) {
     <div id="qResult" class="mt-5 space-y-4"></div>
   </div>
 
-  <!-- 页脚 -->
   <footer class="text-center text-[11.5px] text-slate-400 leading-relaxed py-6 space-y-1">
     <div><a href="/admin" class="hover:text-indigo-500 underline decoration-dotted">后台管理</a></div>
     <div>Copyright © 2026 SAK All rights reserved.</div>
@@ -986,7 +743,6 @@ function renderHome(env) {
   </footer>
 </div>
 
-<!-- IP 详情弹窗 -->
 <div id="ipModal" class="modal">
   <div class="modal-box">
     <div class="flex items-center justify-between px-5 py-4 border-b border-slate-100 sticky top-0 bg-white rounded-t-2xl">
@@ -999,11 +755,9 @@ function renderHome(env) {
 
 <script>
 (function () {
-  const IPAPI_KEY = ${JSON.stringify(ipapiKey)};
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
 
-  /* ---------------- 创建者信息采集 ---------------- */
   let creatorWebRTC = [];
   let creatorFingerprint = null;
 
@@ -1014,15 +768,12 @@ function renderHome(env) {
         creatorFingerprint = await fp.get();
       }
     } catch (e) {}
-
     try {
       const ips = new Set();
-      const pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun.miwifi.com:3478" }
-        ]
-      });
+      const pc = new RTCPeerConnection({ iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun.miwifi.com:3478" }
+      ]});
       pc.createDataChannel("x");
       pc.onicecandidate = e => {
         if (!e.candidate || !e.candidate.candidate) return;
@@ -1038,7 +789,6 @@ function renderHome(env) {
     } catch (e) {}
   })();
 
-  /* ---------------- 密码显隐 ---------------- */
   $("#pwdEye").addEventListener("click", () => {
     const el = $("#password");
     const isPwd = el.type === "password";
@@ -1046,9 +796,7 @@ function renderHome(env) {
     $("#pwdEye").innerHTML = isPwd ? '<i class="fa-regular fa-eye-slash"></i>' : '<i class="fa-regular fa-eye"></i>';
   });
 
-  /* ---------------- 媒体类型切换 ---------------- */
   let kind = "image";
-
   function currentMode() {
     if (kind === "image") {
       const r = document.querySelector('input[name="imageMode"]:checked');
@@ -1059,21 +807,16 @@ function renderHome(env) {
     const v = r ? r.value : "upload";
     return v === "url" ? "video-url" : "video-upload";
   }
-
   function refreshUI() {
     const mode = currentMode();
-
     $$("#imageOpts .opt, #videoOpts .opt").forEach(el => {
       const input = el.querySelector("input");
       el.classList.toggle("on", input.checked);
     });
-
     const needUrl = mode === "image-url" || mode === "video-url";
     const needFile = mode === "image-upload" || mode === "video-upload";
-
     $("#urlBox").classList.toggle("hidden", !needUrl);
     $("#fileBox").classList.toggle("hidden", !needFile);
-
     if (needFile) {
       const isVideo = mode === "video-upload";
       const input = $("#mediaFile");
@@ -1084,10 +827,8 @@ function renderHome(env) {
         ? "支持 MP4 / WebM / OGG / MOV，单个文件不超过 5MB"
         : "支持 JPG / PNG / GIF / WebP / BMP，单个文件不超过 5MB";
     }
-
     $("#mediaUrl").placeholder = (mode === "video-url") ? "https://…/video.mp4" : "https://…/image.jpg";
   }
-
   $("#kindTabs").addEventListener("click", e => {
     const btn = e.target.closest("button[data-kind]");
     if (!btn) return;
@@ -1098,31 +839,21 @@ function renderHome(env) {
     $("#mediaFile").value = "";
     refreshUI();
   });
-
   document.addEventListener("change", e => {
     if (e.target.name === "imageMode" || e.target.name === "videoMode") refreshUI();
   });
-
   refreshUI();
 
-  /* ---------------- 生成 ---------------- */
   $("#genBtn").addEventListener("click", async () => {
     const customId = $("#customId").value.trim();
     const password = $("#password").value;
     const mode = currentMode();
     const file = $("#mediaFile").files[0];
 
-    if (!/^[A-Za-z0-9_-]{4,32}$/.test(customId)) {
-      alert("追踪 ID 需为 4–32 位字母、数字、下划线或短横线");
-      return;
-    }
-    if (password.length < 4 || password.length > 64) {
-      alert("访问密码长度需为 4–64 位");
-      return;
-    }
+    if (!/^[A-Za-z0-9_-]{4,32}$/.test(customId)) { alert("追踪 ID 需为 4–32 位字母、数字、下划线或短横线"); return; }
+    if (password.length < 4 || password.length > 64) { alert("访问密码长度需为 4–64 位"); return; }
     if ((mode === "image-url" || mode === "video-url") && !/^https?:\\/\\/.+/i.test($("#mediaUrl").value.trim())) {
-      alert("请填写有效的 http(s) 链接");
-      return;
+      alert("请填写有效的 http(s) 链接"); return;
     }
     if ((mode === "image-upload" || mode === "video-upload")) {
       if (!file) { alert("请选择要上传的文件"); return; }
@@ -1132,7 +863,6 @@ function renderHome(env) {
     const btn = $("#genBtn");
     btn.disabled = true;
     btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 处理中…';
-
     try {
       const fd = new FormData();
       fd.append("customId", customId);
@@ -1145,12 +875,7 @@ function renderHome(env) {
 
       const res = await fetch("/api/generate", { method: "POST", body: fd });
       const data = await res.json();
-
-      if (!res.ok || data.error) {
-        alert(data.error || "生成失败");
-        return;
-      }
-
+      if (!res.ok || data.error) { alert(data.error || "生成失败"); return; }
       $("#codeOut").value = data.trackingHtml;
       $("#trackId").textContent = data.id;
       $("#result").classList.remove("hidden");
@@ -1170,21 +895,17 @@ function renderHome(env) {
       $("#copyBtn").innerHTML = '<i class="fa-solid fa-check"></i> 已复制';
       setTimeout(() => { $("#copyBtn").innerHTML = '<i class="fa-regular fa-copy"></i> 复制'; }, 1600);
     } catch {
-      ta.select();
-      document.execCommand("copy");
+      ta.select(); document.execCommand("copy");
     }
   });
 
-  /* ---------------- 查询 ---------------- */
   const mapPool = {};
-
   function fmtTime(s) {
     if (!s) return "";
     const d = new Date(s.replace(" ", "T") + "Z");
     if (isNaN(d)) return s;
     return d.toLocaleString("zh-CN", { hour12: false });
   }
-
   function escapeHtml(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1195,29 +916,19 @@ function renderHome(env) {
     const id = $("#qId").value.trim();
     const pwd = $("#qPwd").value;
     const box = $("#qResult");
-
-    if (!id || !pwd) {
-      box.innerHTML = '<p class="text-[13px] text-red-500">请填写追踪 ID 和访问密码</p>';
-      return;
-    }
-
+    if (!id || !pwd) { box.innerHTML = '<p class="text-[13px] text-red-500">请填写追踪 ID 和访问密码</p>'; return; }
     box.innerHTML = '<p class="text-[13px] text-slate-400"><i class="fa-solid fa-spinner fa-spin mr-1"></i>查询中…</p>';
 
     try {
       const res = await fetch("/api/query?id=" + encodeURIComponent(id) +
         "&password=" + encodeURIComponent(pwd) + "&burn=" + (burn ? "true" : "false"));
       const data = await res.json();
-
       if (!res.ok || data.error) {
         box.innerHTML = '<p class="text-[13px] text-red-500">' + escapeHtml(data.error || "查询失败") + '</p>';
         return;
       }
-
       const logs = data.logs || [];
-      if (logs.length === 0) {
-        box.innerHTML = '<p class="text-[13px] text-slate-400">暂无访问记录</p>';
-        return;
-      }
+      if (logs.length === 0) { box.innerHTML = '<p class="text-[13px] text-slate-400">暂无访问记录</p>'; return; }
 
       const groups = new Map();
       for (const log of logs) {
@@ -1227,37 +938,32 @@ function renderHome(env) {
       }
 
       let html = "";
+      const mapIds = [];
       let idx = 0;
-
       for (const [ip, items] of groups) {
         const first = items[0];
         const isLocal = items.some(x => x.is_local === true);
         const place = [first.country, first.region, first.city].filter(Boolean).join(" · ");
         const cc = (first.country_code || "").toLowerCase();
         const mapId = "m" + (idx++) + "_" + Math.random().toString(36).slice(2, 7);
+        mapIds.push({ id: mapId, lat: first.lat, lon: first.lon, ip: first.ip, city: first.city, country: first.country });
 
         html += '<div class="rounded-2xl border border-slate-200 bg-slate-50/60 p-4 overflow-hidden">';
-
         html += '<div class="flex flex-wrap items-start gap-x-3 gap-y-2">';
         html += '<div class="min-w-0 flex-1">';
         html += '<div class="flex flex-wrap items-center gap-x-2 gap-y-1">';
         html += '<span class="ip-addr text-[14px] sm:text-[15px] font-bold text-indigo-700">' + escapeHtml(ip) + '</span>';
         if (cc) html += '<img class="flag" src="https://ipdata.co/flags/' + cc + '.png" alt="" loading="lazy">';
-        if (isLocal) html += '<span class="local-badge"><i class="fa-solid fa-house mr-0.5"></i>本地</span>';
+        if (isLocal) html += '<span class="local-badge"><i class="fa-solid fa-house mr-0.5"></i>本地查看</span>';
         html += '</div>';
         if (place) html += '<div class="text-[12px] text-slate-500 mt-1 break-words">' + escapeHtml(place) + '</div>';
         html += '</div>';
-
         html += '<div class="flex items-center gap-2 shrink-0">';
         html += '<span class="text-[11.5px] text-slate-400 whitespace-nowrap">' + items.length + ' 次</span>';
         html += '<button class="ip-btn btn btn-ghost !py-1 !px-2.5 !text-[12px]" data-ip="' + escapeHtml(ip) + '">详情</button>';
         html += '</div>';
         html += '</div>';
-
-        if (first.lat && first.lon) {
-          html += '<div id="' + mapId + '" class="mapbox"></div>';
-        }
-
+        if (first.lat && first.lon) html += '<div id="' + mapId + '" class="mapbox"></div>';
         html += '<div class="tl mt-3">';
         for (const log of items) {
           html += '<div class="tl-item">';
@@ -1265,42 +971,29 @@ function renderHome(env) {
           html += '<span class="text-[11.5px] text-slate-400">' + fmtTime(log.opened_at) + '</span>';
           if (log.is_local) html += '<span class="local-badge">本地</span>';
           html += '</div>';
-          if (log.ua) {
-            html += '<div class="text-[11.5px] text-slate-500 mt-1 break-all leading-relaxed">' +
-              escapeHtml(log.ua) + '</div>';
-          }
-          if (log.referer) {
-            html += '<div class="text-[11px] text-slate-400 mt-0.5 break-all">来源：' + escapeHtml(log.referer) + '</div>';
-          }
+          if (log.ua) html += '<div class="text-[11.5px] text-slate-500 mt-1 break-all leading-relaxed">' + escapeHtml(log.ua) + '</div>';
+          if (log.referer) html += '<div class="text-[11px] text-slate-400 mt-0.5 break-all">来源：' + escapeHtml(log.referer) + '</div>';
           html += '</div>';
         }
-        html += '</div>';
-        html += '</div>';
+        html += '</div></div>';
       }
-
       box.innerHTML = html;
 
-      idx = 0;
-      for (const [, items] of groups) {
-        const first = items[0];
-        if (!first.lat || !first.lon) { idx++; continue; }
-        const el = box.children[idx] ? box.children[idx].querySelector(".mapbox") : null;
-        idx++;
+      for (const m of mapIds) {
+        if (!m.lat || !m.lon) continue;
+        const el = document.getElementById(m.id);
         if (!el) continue;
         try {
-          if (mapPool[el.id]) mapPool[el.id].remove();
-          const map = L.map(el.id, { zoomControl: true, attributionControl: false }).setView([first.lat, first.lon], 6);
+          if (mapPool[m.id]) mapPool[m.id].remove();
+          const map = L.map(m.id, { zoomControl: true, attributionControl: false }).setView([m.lat, m.lon], 6);
           L.tileLayer("/tile/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(map);
-          L.marker([first.lat, first.lon]).addTo(map)
-            .bindPopup(escapeHtml(first.ip || "") + "<br>" + escapeHtml([first.city, first.country].filter(Boolean).join(", ")));
-          mapPool[el.id] = map;
+          L.marker([m.lat, m.lon]).addTo(map).bindPopup(escapeHtml(m.ip || "") + "<br>" + escapeHtml([m.city, m.country].filter(Boolean).join(", ")));
+          mapPool[m.id] = map;
         } catch (e) {}
       }
-
       box.querySelectorAll(".ip-btn").forEach(btn => {
         btn.addEventListener("click", () => openIpDetail(btn.dataset.ip));
       });
-
     } catch (e) {
       box.innerHTML = '<p class="text-[13px] text-red-500">查询失败：' + escapeHtml(e.message) + '</p>';
     }
@@ -1316,21 +1009,12 @@ function renderHome(env) {
     const id = $("#qId").value.trim();
     const pwd = $("#qPwd").value;
     const box = $("#stats");
-
-    if (!id || !pwd) {
-      box.textContent = "请填写追踪 ID 和访问密码";
-      box.classList.remove("hidden");
-      return;
-    }
-
+    if (!id || !pwd) { box.textContent = "请填写追踪 ID 和访问密码"; box.classList.remove("hidden"); return; }
     try {
       const res = await fetch("/api/stats?id=" + encodeURIComponent(id) + "&password=" + encodeURIComponent(pwd));
       const d = await res.json();
       box.classList.remove("hidden");
-      if (!res.ok || d.error) {
-        box.innerHTML = '<span class="text-red-500">' + escapeHtml(d.error) + '</span>';
-        return;
-      }
+      if (!res.ok || d.error) { box.innerHTML = '<span class="text-red-500">' + escapeHtml(d.error) + '</span>'; return; }
       box.innerHTML =
         '<span class="font-semibold text-slate-700">总访问</span> <b class="text-indigo-600">' + d.total + '</b> 次　·　' +
         '<span class="font-semibold text-slate-700">独立 IP</span> <b class="text-emerald-600">' + d.uniqueIps + '</b> 个　·　' +
@@ -1341,11 +1025,10 @@ function renderHome(env) {
     }
   });
 
-  /* ---------------- IP 详情弹窗（直接调用 ipapi.is） ---------------- */
+  /* IP 弹窗（走服务端代理，避免 Unknown 直接打上游 404） */
   const ipModal = $("#ipModal");
   const ipBody = $("#ipBody");
   let detailMap = null;
-
   $("#ipClose").addEventListener("click", () => {
     ipModal.classList.remove("on");
     if (detailMap) { detailMap.remove(); detailMap = null; }
@@ -1368,18 +1051,16 @@ function renderHome(env) {
 
     let data = null;
     try {
-      const url = "https://api.ipapi.is/?q=" + encodeURIComponent(ip) +
-                  "&key=" + encodeURIComponent(IPAPI_KEY);
-      const res = await fetch(url);
-      if (res.ok) data = await res.json();
-      else data = { error: "查询失败 HTTP " + res.status };
-    } catch (e) {
-      data = { error: "网络异常" };
-    }
+      const res = await fetch("/api/ip?ip=" + encodeURIComponent(ip));
+      data = await res.json().catch(() => null);
+    } catch (e) { data = null; }
 
-    if (!data || data.error) {
-      ipBody.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">' +
-        escapeHtml((data && data.error) || "无法获取信息") + '</div>';
+    if (!data) {
+      ipBody.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">网络异常，无法获取信息</div>';
+      return;
+    }
+    if (data.error) {
+      ipBody.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">' + escapeHtml(data.error) + '</div>';
       return;
     }
 
@@ -1388,7 +1069,6 @@ function renderHome(env) {
     const asn = data.asn || {};
     const dc = data.datacenter || {};
     const abuse = data.abuse || {};
-
     const cc = (loc.country_code || "").toLowerCase();
     const lat = loc.latitude;
     const lon = loc.longitude;
@@ -1397,12 +1077,6 @@ function renderHome(env) {
     if (typeof data.risk_score === "number") {
       riskText = data.risk_score.toFixed(1) + "%";
       riskCls = data.risk_score > 30 ? "text-red-600 font-bold" : "text-emerald-600 font-bold";
-    } else if (data.is_proxy || data.is_tor || data.is_vpn || data.is_abuser) {
-      riskText = "高风险";
-      riskCls = "text-red-600 font-bold";
-    } else if (data.is_datacenter) {
-      riskText = "数据中心";
-      riskCls = "text-amber-600 font-bold";
     }
 
     let h = "";
@@ -1417,7 +1091,7 @@ function renderHome(env) {
     h += row("城市", loc.city || "");
     h += row("时区", loc.timezone || "");
     h += row("经纬度", (lat && lon) ? (lat + ", " + lon) : "");
-    h += '<div class="drow"><span>风控评级</span><span class="' + riskCls + '">' + riskText + '</span></div>';
+    h += '<div class="drow"><span>风险评分</span><span class="' + riskCls + '">' + riskText + '</span></div>';
     h += '</div>';
 
     h += '<div class="sect-title text-emerald-700"><i class="fa-solid fa-building"></i>运营商 / ASN</div><div class="dgrid">';
@@ -1490,13 +1164,8 @@ function renderHome(env) {
 /* =========================================================
  *  后台管理
  * =======================================================*/
-
 async function renderAdmin(request, env) {
-  if (!await isAdmin(request, env)) {
-    return loginPage();
-  }
-
-  const ipapiKey = getIpapiKey(env);
+  if (!await isAdmin(request, env)) return loginPage();
 
   const totalTargets = await env.DB.prepare("SELECT COUNT(*) AS c FROM targets").first();
   const totalLogs = await env.DB.prepare("SELECT COUNT(*) AS c FROM tracking_logs").first();
@@ -1507,13 +1176,9 @@ async function renderAdmin(request, env) {
 
   let logs;
   if (filter) {
-    logs = await env.DB.prepare(
-      "SELECT * FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 300"
-    ).bind(filter).all();
+    logs = await env.DB.prepare("SELECT * FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 300").bind(filter).all();
   } else {
-    logs = await env.DB.prepare(
-      "SELECT * FROM tracking_logs ORDER BY opened_at DESC LIMIT 300"
-    ).all();
+    logs = await env.DB.prepare("SELECT * FROM tracking_logs ORDER BY opened_at DESC LIMIT 300").all();
   }
 
   const targetsResult = await env.DB.prepare(
@@ -1523,7 +1188,6 @@ async function renderAdmin(request, env) {
   const targetMap = {};
   for (const t of targetsResult.results) targetMap[t.id] = t;
 
-  /* ---------- 日志行 ---------- */
   let logRows = "";
   for (const r of logs.results) {
     const date = new Date((r.opened_at || "").replace(" ", "T") + "Z").toLocaleString("zh-CN", { hour12: false });
@@ -1531,11 +1195,12 @@ async function renderAdmin(request, env) {
     const t = targetMap[r.target_id] || {};
 
     let isLocal = false;
-    if (t.creator_ip && r.ip === t.creator_ip) isLocal = true;
+    const logIp = String(r.ip || "").trim();
+    if (t.creator_ip && String(t.creator_ip).trim() === logIp) isLocal = true;
     if (!isLocal && t.creator_webrtc_ips) {
       try {
         const arr = JSON.parse(t.creator_webrtc_ips);
-        if (Array.isArray(arr) && arr.includes(r.ip)) isLocal = true;
+        if (Array.isArray(arr) && arr.some(x => String(x).trim() === logIp)) isLocal = true;
       } catch (e) {}
     }
 
@@ -1561,11 +1226,9 @@ async function renderAdmin(request, env) {
     </tr>`;
   }
 
-  /* ---------- 创建者行 ---------- */
   let creatorRows = "";
   for (const [id, info] of Object.entries(targetMap)) {
     const creatorIp = info.creator_ip || "Unknown";
-
     let webrtcHtml = "—";
     if (info.creator_webrtc_ips) {
       try {
@@ -1578,7 +1241,6 @@ async function renderAdmin(request, env) {
         }
       } catch (e) {}
     }
-
     let fpId = "—";
     if (info.creator_fingerprint) {
       try {
@@ -1586,7 +1248,6 @@ async function renderAdmin(request, env) {
         if (fp && fp.visitorId) fpId = fp.visitorId.slice(0, 14) + "…";
       } catch (e) {}
     }
-
     const typeLabel = info.image_type === "video" ? "视频" : (info.image_type === "image" ? "图片" : "像素");
 
     creatorRows += `<tr class="border-b border-slate-100 hover:bg-slate-50/70 align-top">
@@ -1622,22 +1283,17 @@ async function renderAdmin(request, env) {
   body{margin:0;background:#f6f8fc;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#0f172a}
   .card{background:#fff;border:1px solid #e9edf5;border-radius:18px;box-shadow:0 4px 22px -12px rgba(15,23,42,.12)}
   .stat{flex:1 1 130px;min-width:130px;background:#fff;border:1px solid #e9edf5;border-radius:16px;padding:16px;text-align:center}
-  .btn{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600;border:none;border-radius:10px;
-       padding:8px 14px;cursor:pointer;transition:.15s}
+  .btn{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;font-weight:600;border:none;border-radius:10px;padding:8px 14px;cursor:pointer;transition:.15s}
   .btn:active{transform:translateY(1px)}
-  .btn-danger{background:#fee2e2;color:#b91c1c}
-  .btn-danger:hover{background:#fecaca}
-  .btn-dark{background:#fef3c7;color:#92400e}
-  .btn-dark:hover{background:#fde68a}
-  .btn-soft{background:#eef2ff;color:#4338ca}
-  .btn-soft:hover{background:#e0e7ff}
+  .btn-danger{background:#fee2e2;color:#b91c1c}.btn-danger:hover{background:#fecaca}
+  .btn-dark{background:#fef3c7;color:#92400e}.btn-dark:hover{background:#fde68a}
+  .btn-soft{background:#eef2ff;color:#4338ca}.btn-soft:hover{background:#e0e7ff}
   .ip-addr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;overflow-wrap:anywhere}
   .local-badge{background:#fef3c7;color:#92400e;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:700;white-space:nowrap}
   .flag{border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.18);vertical-align:-1px}
   table{border-collapse:collapse;width:100%}
   th{background:#f8fafc;font-size:11.5px;font-weight:700;color:#64748b;text-align:left;padding:9px 8px;white-space:nowrap}
-  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;
-         align-items:center;justify-content:center;padding:14px;z-index:90}
+  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:90}
   .modal.on{display:flex}
   .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto}
   .dgrid{display:grid;grid-template-columns:1fr}
@@ -1651,26 +1307,20 @@ async function renderAdmin(request, env) {
 </head>
 <body class="p-3 sm:p-5">
 <div class="max-w-7xl mx-auto space-y-4">
-
-  <!-- 顶部 -->
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <h1 class="text-lg font-bold flex items-center gap-2">
-      <i class="fa-solid fa-gauge-high text-indigo-600"></i>后台管理
-    </h1>
+    <h1 class="text-lg font-bold flex items-center gap-2"><i class="fa-solid fa-gauge-high text-indigo-600"></i>后台管理</h1>
     <div class="flex gap-2">
       <a href="/" class="btn btn-soft"><i class="fa-solid fa-house"></i> 返回首页</a>
       <button id="logoutBtn" class="btn btn-danger"><i class="fa-solid fa-right-from-bracket"></i> 退出登录</button>
     </div>
   </div>
 
-  <!-- 统计 -->
   <div class="flex flex-wrap gap-3">
     <div class="stat"><div class="text-2xl font-bold text-indigo-600">${totalTargets ? totalTargets.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">追踪 ID 总数</div></div>
     <div class="stat"><div class="text-2xl font-bold text-emerald-600">${totalLogs ? totalLogs.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">总访问次数</div></div>
     <div class="stat"><div class="text-2xl font-bold text-amber-600">${uniqueIps ? uniqueIps.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">独立 IP</div></div>
   </div>
 
-  <!-- 日志 -->
   <div class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
       <h2 class="font-bold text-[15px]"><i class="fa-solid fa-list-ul text-indigo-500 mr-1.5"></i>访问日志</h2>
@@ -1694,7 +1344,6 @@ async function renderAdmin(request, env) {
     </div>
   </div>
 
-  <!-- 创建者 -->
   <div class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
       <h2 class="font-bold text-[15px]"><i class="fa-solid fa-user-secret text-emerald-500 mr-1.5"></i>追踪 ID 创建者信息</h2>
@@ -1720,7 +1369,6 @@ async function renderAdmin(request, env) {
   </footer>
 </div>
 
-<!-- IP 弹窗 -->
 <div id="ipModal" class="modal">
   <div class="modal-box">
     <div class="flex items-center justify-between px-5 py-4 border-b border-slate-100 sticky top-0 bg-white rounded-t-2xl">
@@ -1733,23 +1381,19 @@ async function renderAdmin(request, env) {
 
 <script>
 (function () {
-  const IPAPI_KEY = ${JSON.stringify(ipapiKey)};
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
-
   function esc(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
-  /* ---------- 退出 ---------- */
   $("#logoutBtn").addEventListener("click", async () => {
     await fetch("/api/admin/logout", { method: "POST" });
     location.href = "/admin";
   });
 
-  /* ---------- 全选 ---------- */
   $("#checkAllLogs").addEventListener("change", function () {
     $$(".log-check").forEach(cb => cb.checked = this.checked);
   });
@@ -1766,7 +1410,6 @@ async function renderAdmin(request, env) {
     return res.ok;
   }
 
-  /* ---------- 删除单条日志 ---------- */
   document.addEventListener("click", async e => {
     const delLog = e.target.closest(".del-log");
     if (delLog) {
@@ -1775,7 +1418,6 @@ async function renderAdmin(request, env) {
       else alert("删除失败");
       return;
     }
-
     const delTarget = e.target.closest(".del-target");
     if (delTarget) {
       if (!confirm("删除该追踪 ID 及其全部访问记录？")) return;
@@ -1783,16 +1425,14 @@ async function renderAdmin(request, env) {
       else alert("删除失败");
       return;
     }
-
     const ipBtn = e.target.closest(".ip-detail");
     if (ipBtn) {
       const ip = ipBtn.dataset.ip;
-      if (!ip || ip === "Unknown") { alert("无效 IP"); return; }
+      if (!ip || ip === "Unknown") { alert("该 IP 无法查询（Unknown）"); return; }
       openIpDetail(ip);
     }
   });
 
-  /* ---------- 批量删除 ---------- */
   $("#delSelected").addEventListener("click", async () => {
     const ids = $$(".log-check:checked").map(cb => cb.dataset.targetId);
     if (!ids.length) { alert("请先勾选要删除的追踪 ID"); return; }
@@ -1809,7 +1449,6 @@ async function renderAdmin(request, env) {
     else alert("删除失败");
   });
 
-  /* ---------- 清空 ---------- */
   $("#clearLogs").addEventListener("click", async () => {
     if (!confirm("确认清空全部访问日志？（追踪 ID 会保留）")) return;
     if (await post("/api/admin/clear")) location.reload();
@@ -1822,20 +1461,15 @@ async function renderAdmin(request, env) {
     else alert("操作失败");
   });
 
-  /* ---------- 筛选 ---------- */
   $("#filterBtn").addEventListener("click", () => {
     const v = $("#filterInput").value.trim();
     location.href = "/admin" + (v ? "?filter_id=" + encodeURIComponent(v) : "");
   });
-  $("#filterInput").addEventListener("keydown", e => {
-    if (e.key === "Enter") $("#filterBtn").click();
-  });
+  $("#filterInput").addEventListener("keydown", e => { if (e.key === "Enter") $("#filterBtn").click(); });
 
-  /* ---------- IP 详情（直连 ipapi.is） ---------- */
   const modal = $("#ipModal");
   const body = $("#ipBody");
   let dmap = null;
-
   function closeModal() {
     modal.classList.remove("on");
     if (dmap) { dmap.remove(); dmap = null; }
@@ -1852,29 +1486,20 @@ async function renderAdmin(request, env) {
     modal.classList.add("on");
     body.innerHTML = '<div class="text-center py-10 text-slate-400"><i class="fa-solid fa-spinner fa-spin"></i></div>';
 
-    let data;
+    let data = null;
     try {
-      const url = "https://api.ipapi.is/?q=" + encodeURIComponent(ip) +
-                  "&key=" + encodeURIComponent(IPAPI_KEY);
-      const res = await fetch(url);
-      data = await res.json();
-      if (!res.ok) data = { error: data.error || "查询失败" };
-    } catch (e) {
-      data = { error: "网络异常" };
-    }
+      const res = await fetch("/api/ip?ip=" + encodeURIComponent(ip));
+      data = await res.json().catch(() => null);
+    } catch (e) { data = null; }
 
-    if (!data || data.error) {
-      body.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">' +
-        esc((data && data.error) || "无法获取信息") + '</div>';
-      return;
-    }
+    if (!data) { body.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">网络异常</div>'; return; }
+    if (data.error) { body.innerHTML = '<div class="text-[13px] text-red-500 py-6 text-center">' + esc(data.error) + '</div>'; return; }
 
     const loc = data.location || {};
     const comp = data.company || {};
     const asn = data.asn || {};
     const dc = data.datacenter || {};
     const abuse = data.abuse || {};
-
     const cc = (loc.country_code || "").toLowerCase();
     const lat = loc.latitude;
     const lon = loc.longitude;
@@ -1883,12 +1508,6 @@ async function renderAdmin(request, env) {
     if (typeof data.risk_score === "number") {
       riskText = data.risk_score.toFixed(1) + "%";
       riskCls = data.risk_score > 30 ? "text-red-600 font-bold" : "text-emerald-600 font-bold";
-    } else if (data.is_proxy || data.is_tor || data.is_vpn || data.is_abuser) {
-      riskText = "高风险";
-      riskCls = "text-red-600 font-bold";
-    } else if (data.is_datacenter) {
-      riskText = "数据中心";
-      riskCls = "text-amber-600 font-bold";
     }
 
     let h = "";
@@ -1903,7 +1522,7 @@ async function renderAdmin(request, env) {
     h += row("城市", loc.city || "");
     h += row("时区", loc.timezone || "");
     h += row("经纬度", (lat && lon) ? (lat + ", " + lon) : "");
-    h += '<div class="drow"><span>风控评级</span><span class="' + riskCls + '">' + riskText + '</span></div>';
+    h += '<div class="drow"><span>风险评分</span><span class="' + riskCls + '">' + riskText + '</span></div>';
     h += '</div>';
 
     h += '<div class="sect-title text-emerald-700"><i class="fa-solid fa-building"></i>运营商 / ASN</div><div class="dgrid">';
@@ -1925,7 +1544,6 @@ async function renderAdmin(request, env) {
       h += row("网段", dc.network || "");
       h += '</div>';
     }
-
     if (abuse.email) {
       h += '<div class="sect-title text-red-600"><i class="fa-solid fa-triangle-exclamation"></i>滥用举报</div><div class="dgrid">';
       h += row("姓名", abuse.name || "");
@@ -1950,7 +1568,6 @@ async function renderAdmin(request, env) {
       h += '<div class="sect-title text-blue-700"><i class="fa-solid fa-map"></i>地理位置</div>';
       h += '<div id="adminMap" class="mapbox"></div>';
     }
-
     body.innerHTML = h;
 
     if (lat && lon) {
@@ -1970,8 +1587,13 @@ async function renderAdmin(request, env) {
 <\/script>
 </body>
 </html>`;
-
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function loginPage() {
@@ -1985,21 +1607,14 @@ function loginPage() {
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
   *{-webkit-tap-highlight-color:transparent}
-  body{
-    margin:0;min-height:100vh;
-    font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-    background:radial-gradient(1000px 500px at 50% -15%,#e5eaff 0%,#f4f7fc 50%,#eef2f8 100%);
-    display:flex;align-items:center;justify-content:center;padding:20px;
-  }
-  .box{width:100%;max-width:380px;background:#fff;border:1px solid #e9edf5;border-radius:22px;
-       box-shadow:0 18px 50px -22px rgba(15,23,42,.28);padding:32px 28px}
-  .fld{width:100%;border:1px solid #dfe5f0;border-radius:12px;padding:11px 14px;font-size:14px;
-       outline:none;background:#fbfcfe;transition:.18s}
+  body{margin:0;min-height:100vh;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:radial-gradient(1000px 500px at 50% -15%,#e5eaff 0%,#f4f7fc 50%,#eef2f8 100%);
+       display:flex;align-items:center;justify-content:center;padding:20px}
+  .box{width:100%;max-width:380px;background:#fff;border:1px solid #e9edf5;border-radius:22px;box-shadow:0 18px 50px -22px rgba(15,23,42,.28);padding:32px 28px}
+  .fld{width:100%;border:1px solid #dfe5f0;border-radius:12px;padding:11px 14px;font-size:14px;outline:none;background:#fbfcfe;transition:.18s}
   .fld:focus{border-color:#6366f1;background:#fff;box-shadow:0 0 0 3px rgba(99,102,241,.12)}
-  .btn{width:100%;background:#4f46e5;color:#fff;border:none;border-radius:12px;padding:11px;
-       font-size:14px;font-weight:600;cursor:pointer;transition:.16s}
-  .btn:hover{background:#4338ca}
-  .btn:disabled{opacity:.6;cursor:not-allowed}
+  .btn{width:100%;background:#4f46e5;color:#fff;border:none;border-radius:12px;padding:11px;font-size:14px;font-weight:600;cursor:pointer;transition:.16s}
+  .btn:hover{background:#4338ca}.btn:disabled{opacity:.6;cursor:not-allowed}
   .msg{margin-top:12px;font-size:12.5px;color:#dc2626}
 </style>
 </head>
@@ -2030,16 +1645,13 @@ function loginPage() {
   const pwd = document.getElementById('pwd');
   const btn = document.getElementById('btn');
   const msg = document.getElementById('msg');
-
   function show(t){ msg.textContent = t; msg.classList.remove('hidden'); }
   function hide(){ msg.classList.add('hidden'); }
-
   async function login(){
     const v = pwd.value;
     if (!v) { show('请输入密码'); return; }
     hide();
-    btn.disabled = true;
-    btn.textContent = '登录中…';
+    btn.disabled = true; btn.textContent = '登录中…';
     try {
       const res = await fetch('/api/admin/login', {
         method: 'POST',
@@ -2052,10 +1664,8 @@ function loginPage() {
     } catch (e) {
       show('网络异常，请稍后重试');
     }
-    btn.disabled = false;
-    btn.textContent = '登 录';
+    btn.disabled = false; btn.textContent = '登 录';
   }
-
   btn.addEventListener('click', login);
   pwd.addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
   pwd.focus();
