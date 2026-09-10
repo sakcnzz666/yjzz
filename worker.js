@@ -7,41 +7,66 @@ const MAX_UPLOAD_SIZE = 5 * 1024 * 1024; // 5MB
 const ALLOWED_IMAGE_TYPES = ['image/jpeg','image/png','image/gif','image/webp','image/bmp','image/svg+xml','image/avif'];
 const ALLOWED_VIDEO_TYPES = ['video/mp4','video/webm','video/ogg','video/quicktime','video/x-msvideo','video/x-matroska'];
 
+let DB_INIT_CACHE = false; // 内存缓存，已初始化则跳过检查
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // 必须设置 ADMIN 环境变量
-    if (!env.ADMIN) {
-      return new Response(`<!DOCTYPE html>
-<html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>需要配置环境变量</title>
-<script src="https://cdn.tailwindcss.com"></script></head>
-<body class="bg-gradient-to-br from-slate-100 to-indigo-100 flex items-center justify-center min-h-screen p-4">
-<div class="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full">
-  <div class="text-center mb-5">
-    <div class="inline-flex items-center justify-center w-16 h-16 bg-amber-100 rounded-2xl mb-3">
-      <span class="text-3xl">⚙️</span>
-    </div>
-    <h1 class="text-xl font-bold text-gray-800">需要配置环境变量</h1>
-  </div>
-  <p class="text-gray-600 text-sm mb-4">请在 Cloudflare Workers 控制台 → Settings → Variables and Secrets 添加以下变量：</p>
-  <div class="bg-gray-50 rounded-xl p-3 font-mono text-sm mb-3 border">
-    <div class="font-bold text-indigo-600">ADMIN</div>
-    <div class="text-gray-500 text-xs mt-1">管理员登录密码（必须，Text 类型）</div>
-  </div>
-  <div class="bg-gray-50 rounded-xl p-3 font-mono text-sm mb-3 border">
-    <div class="font-bold text-emerald-600">IPAPI_KEY <span class="text-xs text-gray-400 font-normal">（可选）</span></div>
-    <div class="text-gray-500 text-xs mt-1">ipapi.is 的 API Key，不填也能用</div>
-  </div>
-  <p class="text-gray-500 text-xs">保存后刷新本页面即可使用。</p>
-</div>
-</body></html>`, { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    // ============ 1. 环境变量检查 ============
+    const hasAdmin = typeof env.ADMIN === 'string' && env.ADMIN.trim().length > 0;
+    const hasIPKey = typeof env.IPAPI_KEY === 'string' && env.IPAPI_KEY.trim().length > 0;
+
+    // ============ 2. D1 数据库检查 ============
+    let hasDB = false;
+    let dbError = null;
+    if (env.DB) {
+      try {
+        await env.DB.prepare("SELECT 1 AS ok").first();
+        hasDB = true;
+      } catch (e) {
+        dbError = "D1 数据库访问失败: " + (e.message || String(e));
+      }
+    } else {
+      dbError = "未绑定 D1 数据库（绑定变量名必须为 DB）";
     }
 
-    await initDB(env);
+    // ============ 3. 数据库初始化状态检查 ============
+    let needsInit = false;
+    if (hasDB && !DB_INIT_CACHE) {
+      try {
+        const row = await env.DB.prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='targets'"
+        ).first();
+        needsInit = !row;
+        if (row) DB_INIT_CACHE = true;
+      } catch (e) {
+        dbError = "D1 初始化检测失败: " + (e.message || String(e));
+        hasDB = false;
+      }
+    }
 
+    // ============ 4. 配置不完整 → 显示配置检查页 ============
+    if (!hasAdmin || !hasDB) {
+      return renderSetupPage(hasAdmin, hasDB, hasIPKey, dbError);
+    }
+
+    // ============ 5. 数据库未初始化 → 显示部署页 ============
+    if (needsInit) {
+      if (path === "/api/init" && request.method === "POST") {
+        try {
+          await initDB(env);
+          DB_INIT_CACHE = true;
+          return jsonResponse({ success: true });
+        } catch (e) {
+          return jsonResponse({ error: e.message || String(e) }, 500);
+        }
+      }
+      return renderDeployPage();
+    }
+
+    // ============ 6. 正常路由 ============
     if (path === "/" || path === "/index.html") return renderHome(request, env);
     if (path.startsWith("/pixel/")) {
       const id = path.split("/")[2];
@@ -67,6 +92,180 @@ export default {
 
 function notFound() {
   return new Response("Not Found", { status: 404 });
+}
+
+// ---------- 配置检查页 ----------
+function renderSetupPage(hasAdmin, hasDB, hasIPKey, dbError) {
+  const checkIcon = (ok) => ok
+    ? '<div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-green-500 text-white font-bold text-lg">✓</div>'
+    : '<div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-red-500 text-white font-bold text-lg">✗</div>';
+
+  const html = `<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>配置检查</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;}
+  .glass{background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);}
+  code{background:#f3f4f6;padding:1px 6px;border-radius:4px;font-size:0.85em;}
+</style>
+</head>
+<body class="flex items-center justify-center p-4">
+<div class="glass rounded-3xl shadow-2xl p-8 w-full max-w-2xl">
+  <div class="text-center mb-6">
+    <div class="inline-flex items-center justify-center w-20 h-20 bg-amber-100 rounded-3xl mb-4">
+      <span class="text-4xl">⚙️</span>
+    </div>
+    <h1 class="text-2xl font-bold text-gray-800">配置检查</h1>
+    <p class="text-sm text-gray-500 mt-1">请先完成以下配置，否则无法使用</p>
+  </div>
+
+  <!-- ADMIN -->
+  <div class="flex items-start gap-3 p-4 rounded-2xl border-2 ${hasAdmin ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'} mb-3">
+    ${checkIcon(hasAdmin)}
+    <div class="flex-1 min-w-0">
+      <div class="font-bold text-gray-800">ADMIN 环境变量（必填）</div>
+      <div class="text-sm mt-1 ${hasAdmin ? 'text-green-700' : 'text-red-700'}">${hasAdmin ? '已配置 ✓' : '未配置 ✗'}</div>
+      ${!hasAdmin ? `
+      <div class="text-xs text-gray-700 mt-3 bg-white rounded-xl p-3 border">
+        <p class="font-semibold mb-2">配置步骤：</p>
+        <ol class="list-decimal list-inside space-y-1 leading-relaxed">
+          <li>Cloudflare Dashboard → Workers &amp; Pages</li>
+          <li>选择你的 Worker → <b>Settings</b> → <b>Variables and Secrets</b></li>
+          <li>点击 <b>Add</b>，名称填 <code>ADMIN</code>，值为你的管理员密码</li>
+          <li>类型选 <b>Text</b> 或 <b>Secret</b>，保存</li>
+          <li><b class="text-red-600">⚠️ 回到 Worker 编辑页，点击一次 Save and Deploy（关键！变量需要重新部署才生效）</b></li>
+        </ol>
+      </div>` : ''}
+    </div>
+  </div>
+
+  <!-- DB -->
+  <div class="flex items-start gap-3 p-4 rounded-2xl border-2 ${hasDB ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'} mb-3">
+    ${checkIcon(hasDB)}
+    <div class="flex-1 min-w-0">
+      <div class="font-bold text-gray-800">D1 数据库绑定（必填）</div>
+      <div class="text-sm mt-1 ${hasDB ? 'text-green-700' : 'text-red-700'}">${hasDB ? '已绑定 ✓' : '未绑定 ✗'}</div>
+      ${dbError ? `<div class="text-xs text-red-600 mt-1 break-all">${dbError}</div>` : ''}
+      ${!hasDB ? `
+      <div class="text-xs text-gray-700 mt-3 bg-white rounded-xl p-3 border">
+        <p class="font-semibold mb-2">配置步骤：</p>
+        <ol class="list-decimal list-inside space-y-1 leading-relaxed">
+          <li>Cloudflare Dashboard → <b>Workers &amp; Pages</b> → <b>D1</b></li>
+          <li>点击 <b>Create database</b> 创建一个新的数据库</li>
+          <li>回到你的 Worker → <b>Settings</b> → <b>Bindings</b>（绑定）</li>
+          <li>点击 <b>Add binding</b> → 选择 <b>D1 database</b></li>
+          <li>变量名必须填 <code>DB</code>（大写），选择刚才创建的数据库，保存</li>
+          <li><b class="text-red-600">⚠️ 重新部署 Worker 后刷新本页</b></li>
+        </ol>
+      </div>` : ''}
+    </div>
+  </div>
+
+  <!-- IPAPI_KEY（可选） -->
+  <div class="flex items-start gap-3 p-4 rounded-2xl border-2 ${hasIPKey ? 'border-green-200 bg-green-50' : 'border-blue-200 bg-blue-50'} mb-3">
+    ${hasIPKey
+      ? '<div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-green-500 text-white font-bold text-lg">✓</div>'
+      : '<div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-blue-500 text-white font-bold text-lg">i</div>'}
+    <div class="flex-1 min-w-0">
+      <div class="font-bold text-gray-800">IPAPI_KEY 环境变量 <span class="text-xs font-normal text-gray-500">（可选）</span></div>
+      <div class="text-sm mt-1 ${hasIPKey ? 'text-green-700' : 'text-blue-700'}">${hasIPKey ? '已配置 ✓' : '未配置，IP 详情功能可能受限'}</div>
+      <div class="text-xs text-gray-500 mt-1">变量名 <code>IPAPI_KEY</code>，用于 ipapi.is 查询 IP 详细信息，不填也能用。</div>
+    </div>
+  </div>
+
+  <div class="mt-6 text-center">
+    <button onclick="location.reload(true)" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3 px-8 rounded-xl transition">🔄 重新检查</button>
+  </div>
+
+  <div class="mt-6 pt-4 border-t text-center text-xs text-gray-400 leading-relaxed">
+    Copyright © 2026 <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK</a> All rights reserved.<br>
+    QQ: 3344310554 · E-mail: <a href="mailto:cnzz666@163.com" class="hover:text-indigo-500">cnzz666@163.com</a> · Bilibili: <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK _CN</a>
+  </div>
+</div>
+</body></html>`;
+  return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// ---------- 部署确认页 ----------
+function renderDeployPage() {
+  const html = `<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>准备就绪</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{background:linear-gradient(135deg,#10b981 0%,#059669 100%);min-height:100vh;}
+  .glass{background:rgba(255,255,255,0.96);backdrop-filter:blur(20px);}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,0.7);}50%{box-shadow:0 0 0 18px rgba(34,197,94,0);}}
+  .pulse-btn{animation:pulse 2s infinite;}
+</style>
+</head>
+<body class="flex items-center justify-center p-4">
+<div class="glass rounded-3xl shadow-2xl p-8 w-full max-w-2xl">
+  <div class="text-center mb-6">
+    <div class="inline-flex items-center justify-center w-20 h-20 bg-green-100 rounded-full mb-4">
+      <span class="text-4xl">🎉</span>
+    </div>
+    <h1 class="text-3xl font-bold text-gray-800">环境检查通过</h1>
+    <p class="text-sm text-gray-500 mt-2">所有配置已就绪，点击下方按钮初始化数据库</p>
+  </div>
+
+  <div class="space-y-3 mb-6">
+    <div class="flex items-center gap-3 p-4 rounded-2xl border-2 border-green-200 bg-green-50">
+      <div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-green-500 text-white font-bold text-lg">✓</div>
+      <div class="flex-1 font-medium text-gray-800">ADMIN 环境变量已配置</div>
+    </div>
+    <div class="flex items-center gap-3 p-4 rounded-2xl border-2 border-green-200 bg-green-50">
+      <div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-green-500 text-white font-bold text-lg">✓</div>
+      <div class="flex-1 font-medium text-gray-800">D1 数据库已绑定</div>
+    </div>
+    <div class="flex items-center gap-3 p-4 rounded-2xl border-2 border-amber-200 bg-amber-50">
+      <div class="flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center bg-amber-500 text-white font-bold text-lg">!</div>
+      <div class="flex-1 font-medium text-gray-800">数据库尚未初始化（点击下方按钮完成）</div>
+    </div>
+  </div>
+
+  <button id="deployBtn" class="pulse-btn w-full text-white font-bold py-4 px-6 rounded-2xl text-lg transition" style="background:linear-gradient(135deg,#10b981,#059669);">
+    🚀 开始部署
+  </button>
+  <div id="deployStatus" class="mt-4 text-center hidden text-sm"></div>
+
+  <div class="mt-6 pt-4 border-t text-center text-xs text-gray-400 leading-relaxed">
+    Copyright © 2026 <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK</a> All rights reserved.<br>
+    QQ: 3344310554 · E-mail: <a href="mailto:cnzz666@163.com" class="hover:text-indigo-500">cnzz666@163.com</a> · Bilibili: <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK _CN</a>
+  </div>
+</div>
+<script>
+document.getElementById('deployBtn').addEventListener('click', async function(){
+  const btn = this;
+  const status = document.getElementById('deployStatus');
+  btn.disabled = true;
+  btn.textContent = '⏳ 部署中...';
+  try{
+    const res = await fetch('/api/init', { method: 'POST' });
+    const data = await res.json();
+    if(data.success){
+      btn.textContent = '✅ 部署成功，正在跳转...';
+      btn.style.background = 'linear-gradient(135deg,#22c55e,#16a34a)';
+      status.innerHTML = '<span class="text-green-600">初始化完成，即将进入首页…</span>';
+      status.classList.remove('hidden');
+      setTimeout(()=>{ location.href = '/'; }, 900);
+    } else {
+      status.innerHTML = '<span class="text-red-500">部署失败: ' + (data.error || '未知错误') + '</span>';
+      status.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = '🚀 重试部署';
+    }
+  }catch(e){
+    status.innerHTML = '<span class="text-red-500">请求失败: ' + e.message + '</span>';
+    status.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = '🚀 重试部署';
+  }
+});
+</script>
+</body></html>`;
+  return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 // ---------- 数据库初始化 ----------
@@ -180,7 +379,6 @@ function isVideoType(file) {
   return ALLOWED_VIDEO_TYPES.includes(file.type.toLowerCase());
 }
 
-// 获取IP信息（用于存储）
 async function getIpInfo(ip) {
   if (!ip || ip === "Unknown" || ip === "127.0.0.1" || ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")) {
     return null;
@@ -209,7 +407,6 @@ async function getIpInfo(ip) {
   }
 }
 
-// 图床上传
 async function uploadImageToHost(file) {
   const formData = new FormData();
   formData.append("file", file, file.name || "file");
@@ -225,7 +422,6 @@ async function uploadImageToHost(file) {
   throw new Error("图床响应格式异常");
 }
 
-// 验证ID+密码访问权限
 async function verifyAccess(env, id, password) {
   if (!id || !password) return { error: "缺少参数", status: 400 };
   const target = await env.DB.prepare(
@@ -247,7 +443,6 @@ async function handlePixel(request, env, ctx, targetId) {
   const mediaUrl = target?.media_url || "";
   const range = request.headers.get("Range");
 
-  // 视频只记录首次请求，避免range分段请求爆日志
   let shouldLog = true;
   if (mediaType === "video" && range && !range.startsWith("bytes=0-")) {
     shouldLog = false;
@@ -289,7 +484,6 @@ async function handlePixel(request, env, ctx, targetId) {
     ).run();
   }
 
-  // 返回媒体内容
   if (mediaType === "pixel" || !mediaUrl) {
     const pixel = "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==";
     const imgBuffer = Uint8Array.from(atob(pixel), c => c.charCodeAt(0));
@@ -335,7 +529,6 @@ async function handlePixel(request, env, ctx, targetId) {
   }
 }
 
-// ---------- 配置接口 ----------
 function handleConfig(env) {
   return jsonResponse({ ipapiKey: env.IPAPI_KEY || "" });
 }
@@ -353,8 +546,8 @@ async function handleGenerate(request, env) {
 
   const id = (formData.get("id") || "").trim();
   const password = (formData.get("password") || "").trim();
-  const mediaKind = formData.get("mediaKind") || "image";      // image | video
-  const mediaSource = formData.get("mediaSource") || "pixel";   // pixel | url | upload
+  const mediaKind = formData.get("mediaKind") || "image";
+  const mediaSource = formData.get("mediaSource") || "pixel";
   const mediaUrl = (formData.get("mediaUrl") || "").trim();
   const mediaFile = formData.get("mediaFile");
   const webrtcIps = formData.get("webrtcIps") || "[]";
@@ -362,7 +555,6 @@ async function handleGenerate(request, env) {
   const creatorIp = request.headers.get("CF-Connecting-IP") || "Unknown";
   const creatorUa = request.headers.get("User-Agent") || "";
 
-  // 参数校验
   if (id.length < 4) return jsonResponse({ error: "追踪ID至少需要4位" }, 400);
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return jsonResponse({ error: "追踪ID只能包含字母、数字、-和_" }, 400);
   if (password.length < 4) return jsonResponse({ error: "访问密码至少需要4位" }, 400);
@@ -624,23 +816,20 @@ function renderHome(request, env) {
     .modal-content { background: white; border-radius: 1.5rem; padding: 1.5rem; max-width: 42rem; width: 92%; max-height: 85vh; overflow-y: auto; }
     .map-container { height: 300px; width: 100%; border-radius: 0.75rem; margin-top: 0.5rem; border: 1px solid #e5e7eb; }
     .ip-word-break { word-break: break-all; overflow-wrap: anywhere; }
-    .local-badge { background: #fbbf24; color: #78350f; padding: 0.1rem 0.5rem; border-radius: 9999px; font-size: 0.65rem; font-weight: 600; margin-left: 0.5rem; }
+    .local-badge { background: #fbbf24; color: #78350f; padding: 0.1rem 0.5rem; border-radius: 9999px; font-size: 0.65rem; font-weight: 600; margin-left: 0.5rem; display: inline-block; }
     .flag-icon { width: 22px; height: 16px; border-radius: 2px; box-shadow: 0 1px 2px rgba(0,0,0,0.2); margin-left: 4px; vertical-align: middle; }
     .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; }
     .detail-item { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #f3f4f6; gap: 8px; }
     .detail-label { color: #6b7280; font-weight: 500; white-space: nowrap; }
     .detail-value { font-weight: 500; word-break: break-word; text-align: right; }
-    .ip-title { word-break: break-all; overflow-wrap: anywhere; }
-    @media (max-width: 640px) {
-      .detail-grid { grid-template-columns: 1fr; }
-    }
+    @media (max-width: 640px) { .detail-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body class="min-h-screen p-4">
   <div class="max-w-6xl mx-auto space-y-6 pt-8">
     <div class="glass rounded-2xl p-6 shadow-sm">
       <h1 class="text-2xl font-bold mb-4 flex items-center"><i class="fa-solid fa-envelope-open-text text-indigo-600 mr-2"></i>邮件追踪器</h1>
-      <p class="text-sm text-gray-500 mb-6">生成追踪代码，粘贴到邮件HTML源码中。对方打开后即可记录详细访问信息，并自动标记“本地查看”。</p>
+      <p class="text-sm text-gray-500 mb-6">生成追踪代码，粘贴到邮件HTML源码中。对方打开后即可记录详细访问信息，并自动标记"本地查看"。</p>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
         <div>
@@ -664,7 +853,6 @@ function renderHome(request, env) {
           </label>
         </div>
 
-        <!-- 图片选项 -->
         <div id="imageOptions" class="space-y-2">
           <div class="flex flex-wrap gap-4">
             <label class="flex items-center gap-1 cursor-pointer"><input type="radio" name="imageSource" value="pixel" checked onchange="onSourceChange()"> 默认1x1像素（隐藏）</label>
@@ -673,7 +861,6 @@ function renderHome(request, env) {
           </div>
         </div>
 
-        <!-- 视频选项 -->
         <div id="videoOptions" class="space-y-2 hidden">
           <div class="flex flex-wrap gap-4">
             <label class="flex items-center gap-1 cursor-pointer"><input type="radio" name="videoSource" value="url" checked onchange="onSourceChange()"> 自定义URL</label>
@@ -1278,6 +1465,11 @@ async function renderAdmin(request, env) {
       <div class="overflow-x-auto">
         <table class="w-full text-sm"><thead class="bg-gray-50"><tr><th class="p-2"><input type="checkbox" id="selectAllCreators"></th><th class="p-2">ID</th><th class="p-2">类型</th><th class="p-2">创建IP</th><th class="p-2">UA</th><th class="p-2">WebRTC IP</th><th class="p-2">指纹ID</th><th class="p-2">操作</th></tr></thead><tbody>${creatorRows}</tbody></table>
       </div>
+    </div>
+
+    <div class="text-center text-xs text-gray-400 mt-8 leading-relaxed">
+      Copyright © 2026 <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK</a> All rights reserved.<br>
+      QQ: 3344310554 · E-mail: <a href="mailto:cnzz666@163.com" class="hover:text-indigo-500">cnzz666@163.com</a> · Bilibili: <a href="https://b23.tv/8fCttY7" target="_blank" class="hover:text-indigo-500">SAK _CN</a>
     </div>
   </div>
 
