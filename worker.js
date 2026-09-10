@@ -15,6 +15,13 @@ const ALLOWED_VIDEO = ["video/mp4", "video/webm", "video/ogg", "video/quicktime"
 
 const PIXEL_B64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
+// ---------- IP 查询 API Key（可通过环境变量 IPAPI_KEY 覆盖） ----------
+const DEFAULT_IPAPI_KEY = "91d0c00fdc50af8b1e84";
+
+function getIpapiKey(env) {
+  return (env && env.IPAPI_KEY && String(env.IPAPI_KEY).trim()) || DEFAULT_IPAPI_KEY;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -35,7 +42,7 @@ export default {
     }
 
     // ---------- 路由 ----------
-    if (path === "/" || path === "/index.html") return renderHome();
+    if (path === "/" || path === "/index.html") return renderHome(env);
     if (path.startsWith("/pixel/")) {
       const id = path.split("/")[2];
       if (!id) return notFound();
@@ -238,7 +245,6 @@ async function doInitDB(env) {
     )
   `).run();
 
-  // 兼容老库：补齐字段
   const targetCols = [
     "pass_hash", "pass_salt", "image_type", "image_url",
     "creator_ip", "creator_ua", "creator_webrtc_ips", "creator_fingerprint"
@@ -267,7 +273,6 @@ async function handlePixel(request, env, ctx, targetId) {
     "SELECT image_type, image_url FROM targets WHERE id = ?"
   ).bind(targetId).first();
 
-  // 未登记的 ID 直接返回空白像素，不产生日志（防止被扫）
   if (!target) return transparentPixel();
 
   const cf = request.cf || {};
@@ -489,7 +494,6 @@ async function handleQuery(request, env) {
 
   const target = check.target;
 
-  // 创建者 IP 集合（用于标记“本地查看”）
   const creatorIpSet = new Set();
   if (target.creator_ip && target.creator_ip !== "Unknown") creatorIpSet.add(target.creator_ip);
   if (target.creator_webrtc_ips) {
@@ -553,7 +557,7 @@ async function handleStats(request, env) {
 }
 
 /* =========================================================
- *  IP 详情（服务端代理，Key 不下发前端）
+ *  IP 详情（服务端代理备用；前端已改用直连 ipapi.is）
  * =======================================================*/
 
 async function handleIpLookup(request, env) {
@@ -562,8 +566,7 @@ async function handleIpLookup(request, env) {
   if (!ip) return jsonResponse({ error: "缺少 IP 参数" }, 400);
   if (ip.length > 64) return jsonResponse({ error: "IP 参数异常" }, 400);
 
-  const key = (env.IPAPI_KEY || "").trim();
-  if (!key) return jsonResponse({ error: "服务端未配置 IPAPI_KEY" }, 503);
+  const key = getIpapiKey(env);
 
   try {
     const resp = await fetch(
@@ -611,7 +614,6 @@ async function handleAdminLogin(request, env) {
     return jsonResponse({ error: "密码错误" }, 401);
   }
 
-  // 单会话：登录时清空其他会话
   await env.DB.prepare("DELETE FROM admin_sessions").run();
 
   const token = randomHex(32);
@@ -791,13 +793,15 @@ function setupNotice() {
  *  首页
  * =======================================================*/
 
-function renderHome() {
+function renderHome(env) {
+  const ipapiKey = getIpapiKey(env);
+
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>访问追踪</title>
+<title>邮件追踪器</title>
 <script src="https://cdn.tailwindcss.com"><\/script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -865,11 +869,12 @@ function renderHome() {
   <!-- 生成卡片 -->
   <div class="card p-5 sm:p-7">
     <div class="flex items-center gap-2 mb-1">
-      <i class="fa-solid fa-satellite-dish text-indigo-600"></i>
-      <h1 class="text-lg sm:text-xl font-bold">访问追踪</h1>
+      <i class="fa-solid fa-envelope-open-text text-indigo-600"></i>
+      <h1 class="text-lg sm:text-xl font-bold">邮件追踪器</h1>
     </div>
     <p class="text-xs sm:text-[13px] text-slate-500 leading-relaxed mb-6">
-      生成一段 HTML 代码，粘贴进邮件源码或网页中。对方打开后会自动记录访问时间、IP、设备等信息。每个追踪 ID 对应独立访问密码，只有你知道。
+      生成追踪图片代码，粘贴到邮件 HTML 源码中。对方打开后即可记录详细访问信息，并自动标记「本地查看」。
+      每个追踪 ID 对应独立访问密码，只有你知道。
     </p>
 
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -909,7 +914,6 @@ function renderHome() {
       <label class="opt"><input type="radio" name="videoMode" value="url"> 自定义视频 URL</label>
     </div>
 
-    <!-- 动态输入区 -->
     <div id="urlBox" class="mt-3 hidden">
       <input id="mediaUrl" class="fld" placeholder="https://…" autocomplete="off" spellcheck="false">
     </div>
@@ -995,6 +999,7 @@ function renderHome() {
 
 <script>
 (function () {
+  const IPAPI_KEY = ${JSON.stringify(ipapiKey)};
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
 
@@ -1058,7 +1063,6 @@ function renderHome() {
   function refreshUI() {
     const mode = currentMode();
 
-    // 高亮选中项
     $$("#imageOpts .opt, #videoOpts .opt").forEach(el => {
       const input = el.querySelector("input");
       el.classList.toggle("on", input.checked);
@@ -1215,7 +1219,6 @@ function renderHome() {
         return;
       }
 
-      // 按 IP 分组
       const groups = new Map();
       for (const log of logs) {
         const key = log.ip || "Unknown";
@@ -1277,7 +1280,6 @@ function renderHome() {
 
       box.innerHTML = html;
 
-      // 初始化地图
       idx = 0;
       for (const [, items] of groups) {
         const first = items[0];
@@ -1290,14 +1292,11 @@ function renderHome() {
           const map = L.map(el.id, { zoomControl: true, attributionControl: false }).setView([first.lat, first.lon], 6);
           L.tileLayer("/tile/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(map);
           L.marker([first.lat, first.lon]).addTo(map)
-            .bindPopup(escapeHtml(ipSafe(first.ip)) + "<br>" + escapeHtml([first.city, first.country].filter(Boolean).join(", ")));
+            .bindPopup(escapeHtml(first.ip || "") + "<br>" + escapeHtml([first.city, first.country].filter(Boolean).join(", ")));
           mapPool[el.id] = map;
         } catch (e) {}
       }
 
-      function ipSafe(v) { return v || ""; }
-
-      // 绑定详情按钮
       box.querySelectorAll(".ip-btn").forEach(btn => {
         btn.addEventListener("click", () => openIpDetail(btn.dataset.ip));
       });
@@ -1342,7 +1341,7 @@ function renderHome() {
     }
   });
 
-  /* ---------------- IP 详情弹窗 ---------------- */
+  /* ---------------- IP 详情弹窗（直接调用 ipapi.is） ---------------- */
   const ipModal = $("#ipModal");
   const ipBody = $("#ipBody");
   let detailMap = null;
@@ -1369,9 +1368,11 @@ function renderHome() {
 
     let data = null;
     try {
-      const res = await fetch("/api/ip?ip=" + encodeURIComponent(ip));
+      const url = "https://api.ipapi.is/?q=" + encodeURIComponent(ip) +
+                  "&key=" + encodeURIComponent(IPAPI_KEY);
+      const res = await fetch(url);
       if (res.ok) data = await res.json();
-      else data = { error: "查询失败" };
+      else data = { error: "查询失败 HTTP " + res.status };
     } catch (e) {
       data = { error: "网络异常" };
     }
@@ -1396,6 +1397,12 @@ function renderHome() {
     if (typeof data.risk_score === "number") {
       riskText = data.risk_score.toFixed(1) + "%";
       riskCls = data.risk_score > 30 ? "text-red-600 font-bold" : "text-emerald-600 font-bold";
+    } else if (data.is_proxy || data.is_tor || data.is_vpn || data.is_abuser) {
+      riskText = "高风险";
+      riskCls = "text-red-600 font-bold";
+    } else if (data.is_datacenter) {
+      riskText = "数据中心";
+      riskCls = "text-amber-600 font-bold";
     }
 
     let h = "";
@@ -1410,7 +1417,7 @@ function renderHome() {
     h += row("城市", loc.city || "");
     h += row("时区", loc.timezone || "");
     h += row("经纬度", (lat && lon) ? (lat + ", " + lon) : "");
-    h += '<div class="drow"><span>风险评分</span><span class="' + riskCls + '">' + riskText + '</span></div>';
+    h += '<div class="drow"><span>风控评级</span><span class="' + riskCls + '">' + riskText + '</span></div>';
     h += '</div>';
 
     h += '<div class="sect-title text-emerald-700"><i class="fa-solid fa-building"></i>运营商 / ASN</div><div class="dgrid">';
@@ -1488,6 +1495,8 @@ async function renderAdmin(request, env) {
   if (!await isAdmin(request, env)) {
     return loginPage();
   }
+
+  const ipapiKey = getIpapiKey(env);
 
   const totalTargets = await env.DB.prepare("SELECT COUNT(*) AS c FROM targets").first();
   const totalLogs = await env.DB.prepare("SELECT COUNT(*) AS c FROM tracking_logs").first();
@@ -1724,6 +1733,7 @@ async function renderAdmin(request, env) {
 
 <script>
 (function () {
+  const IPAPI_KEY = ${JSON.stringify(ipapiKey)};
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
 
@@ -1821,7 +1831,7 @@ async function renderAdmin(request, env) {
     if (e.key === "Enter") $("#filterBtn").click();
   });
 
-  /* ---------- IP 详情 ---------- */
+  /* ---------- IP 详情（直连 ipapi.is） ---------- */
   const modal = $("#ipModal");
   const body = $("#ipBody");
   let dmap = null;
@@ -1833,8 +1843,8 @@ async function renderAdmin(request, env) {
   $("#ipClose").addEventListener("click", closeModal);
   modal.addEventListener("click", e => { if (e.target === modal) closeModal(); });
 
-  function row(label, value) {
-    return '<div class="drow"><span>' + label + '</span><span>' +
+  function row(label, value, cls) {
+    return '<div class="drow"><span>' + label + '</span><span class="' + (cls || "") + '">' +
       esc(value == null || value === "" ? "—" : String(value)) + '</span></div>';
   }
 
@@ -1844,7 +1854,9 @@ async function renderAdmin(request, env) {
 
     let data;
     try {
-      const res = await fetch("/api/ip?ip=" + encodeURIComponent(ip));
+      const url = "https://api.ipapi.is/?q=" + encodeURIComponent(ip) +
+                  "&key=" + encodeURIComponent(IPAPI_KEY);
+      const res = await fetch(url);
       data = await res.json();
       if (!res.ok) data = { error: data.error || "查询失败" };
     } catch (e) {
@@ -1871,6 +1883,12 @@ async function renderAdmin(request, env) {
     if (typeof data.risk_score === "number") {
       riskText = data.risk_score.toFixed(1) + "%";
       riskCls = data.risk_score > 30 ? "text-red-600 font-bold" : "text-emerald-600 font-bold";
+    } else if (data.is_proxy || data.is_tor || data.is_vpn || data.is_abuser) {
+      riskText = "高风险";
+      riskCls = "text-red-600 font-bold";
+    } else if (data.is_datacenter) {
+      riskText = "数据中心";
+      riskCls = "text-amber-600 font-bold";
     }
 
     let h = "";
@@ -1885,7 +1903,7 @@ async function renderAdmin(request, env) {
     h += row("城市", loc.city || "");
     h += row("时区", loc.timezone || "");
     h += row("经纬度", (lat && lon) ? (lat + ", " + lon) : "");
-    h += '<div class="drow"><span>风险评分</span><span class="' + riskCls + '">' + riskText + '</span></div>';
+    h += '<div class="drow"><span>风控评级</span><span class="' + riskCls + '">' + riskText + '</span></div>';
     h += '</div>';
 
     h += '<div class="sect-title text-emerald-700"><i class="fa-solid fa-building"></i>运营商 / ASN</div><div class="dgrid">';
