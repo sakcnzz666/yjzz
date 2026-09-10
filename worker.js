@@ -346,7 +346,6 @@ async function verifyTargetPassword(env, id, password) {
   return { ok: true, target };
 }
 
-// 组装 creatorIpSet（含 Unknown、内网、公网 WebRTC IP 全部纳入）
 function buildCreatorIpSet(target) {
   const s = new Set();
   if (target && target.creator_ip) s.add(String(target.creator_ip).trim());
@@ -371,7 +370,6 @@ async function handleQuery(request, env) {
   const target = check.target;
   const creatorIpSet = buildCreatorIpSet(target);
 
-  // 只返回未清除的记录
   const logs = await env.DB.prepare(`
     SELECT id, target_id, event_type, ip, country, country_code, region, city, timezone,
            isp, org, as_text, lat, lon, ua, languages, referer, accept, accept_encoding,
@@ -386,7 +384,6 @@ async function handleQuery(request, env) {
     is_local: creatorIpSet.has(String(log.ip || "").trim())
   }));
 
-  // 查询并清除：逻辑删除（标记 burned=1），后台仍可见
   if (burn && results.length > 0) {
     await env.DB.prepare(
       "UPDATE tracking_logs SET burned = 1 WHERE target_id = ? AND (burned IS NULL OR burned = 0)"
@@ -585,7 +582,7 @@ ul{margin:10px 0 0;padding-left:20px;color:#94a3b8;font-size:14px;line-height:1.
 }
 
 /* =========================================================
- *  首页（保留你原来上传文件的玻璃卡片风格）
+ *  首页
  * =======================================================*/
 function renderHome(env) {
   const html = `<!DOCTYPE html>
@@ -627,9 +624,10 @@ function renderHome(env) {
   .tl::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:#e6ebf3;border-radius:2px}
   .tl-item{position:relative;padding:7px 0}
   .tl-item::before{content:"";position:absolute;left:-19px;top:14px;width:8px;height:8px;border-radius:50%;background:#6366f1;box-shadow:0 0 0 2.5px #fff}
-  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:90}
+  /* 关键修复：弹窗 z-index 高于 Leaflet 地图（Leaflet 默认 400~700），避免地图遮挡弹窗 */
+  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:9999}
   .modal.on{display:flex}
-  .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto}
+  .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto;position:relative;z-index:1}
   .dgrid{display:grid;grid-template-columns:1fr;gap:0}
   @media(min-width:520px){.dgrid{grid-template-columns:1fr 1fr;gap:0 16px}}
   .drow{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px dashed #eef2f8;font-size:13px}
@@ -649,8 +647,9 @@ function renderHome(env) {
       <h1 class="text-lg sm:text-xl font-bold">邮件追踪器</h1>
     </div>
     <p class="text-xs sm:text-[13px] text-slate-500 leading-relaxed mb-6">
-      生成追踪图片代码，粘贴到邮件 HTML 源码中。对方打开后即可记录详细访问信息，并自动标记「本地查看」。
-      每个追踪 ID 对应独立访问密码，只有你知道。
+      生成邮件追踪代码，支持1x1像素图片，自定义图片，自定义视频追踪，对方打开邮件即可查看对方IP/UA信息，记录对方打开次数，以时间轴显示。
+      目前已实现自动标记本地查看，方便过滤和筛选。
+      且每个ID都有独立访问密码，防止他人恶意查询。
     </p>
 
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -751,7 +750,7 @@ function renderHome(env) {
     <div>Copyright © 2026 SAK All rights reserved.</div>
     <div class="break-words px-2">
       QQ:3344310554 · E-mail:cnzz666@163.com ·
-      <a href="https://b23.tv/8fCttY7" target="_blank" rel="noopener noreferrer" class="text-indigo-500 hover:text-indigo-600">Bilibili:SAK _CN</a>
+      <a href="https://b23.tv/8fCttY7" target="_blank" rel="noopener noreferrer" class="text-indigo-500 hover:text-indigo-600">Bilibili:SAK_CN</a>
     </div>
   </footer>
 </div>
@@ -787,7 +786,6 @@ function renderHome(env) {
       (p[0] === 192 && p[1] === 168) || p[0] === 127 || (p[0] === 169 && p[1] === 254);
   }
 
-  // 采集 WebRTC 泄露 IP（保留原代码正则，同一个逻辑）
   let creatorWebRTC = [], creatorFingerprint = null;
   (async function collect(){
     try {
@@ -960,7 +958,7 @@ function renderHome(env) {
       let idx = 0;
 
       if (burn) {
-        html += '<div class="rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-[12.5px] px-3 py-2">已清除 ' + (data.burnedCount || logs.length) + ' 条记录（后台仍可查看，带「已删除」标记）</div>';
+        html += '<div class="rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-[12.5px] px-3 py-2">已清除 ' + (data.burnedCount || logs.length) + ' 条记录</div>';
       }
 
       for (const [ip, items] of groups) {
@@ -1026,7 +1024,7 @@ function renderHome(env) {
 
   $("#qBtn").addEventListener("click", () => doQuery(false));
   $("#burnBtn").addEventListener("click", () => {
-    if (!confirm("查询后将「逻辑删除」该 ID 下的所有记录（后台仍可见并带已删除标签），确认继续？")) return;
+    if (!confirm("查询后将自动删除该ID下的所有记录，再次查询将失效，确认继续？")) return;
     doQuery(true);
   });
 
@@ -1181,7 +1179,7 @@ function esc(s) {
 
 function loginPage() {
   const html = `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>后台登录</title>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>邮件追踪器后台登录</title>
 <script src="https://cdn.tailwindcss.com"><\/script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
@@ -1202,7 +1200,7 @@ function loginPage() {
     <div class="w-11 h-11 rounded-2xl bg-indigo-50 flex items-center justify-center">
       <i class="fa-solid fa-lock text-indigo-600"></i>
     </div>
-    <div><h1 class="text-[17px] font-bold">后台登录</h1><p class="text-[11.5px] text-slate-400 mt-0.5">仅限管理员访问</p></div>
+    <div><h1 class="text-[17px] font-bold">邮件追踪器后台登录</h1><p class="text-[11.5px] text-slate-400 mt-0.5">请输入管理员密码以继续</p></div>
   </div>
   <label class="block text-[12.5px] font-semibold text-slate-600 mb-1.5">管理员密码</label>
   <input id="pwd" type="password" class="fld" placeholder="请输入密码" autocomplete="current-password">
@@ -1246,7 +1244,6 @@ async function renderAdmin(request, env) {
   const url = new URL(request.url);
   const filter = (url.searchParams.get("filter_id") || "").trim();
 
-  // 后台显示全部（含已删除）
   let logs;
   if (filter) {
     logs = await env.DB.prepare("SELECT * FROM tracking_logs WHERE target_id = ? ORDER BY opened_at DESC LIMIT 300").bind(filter).all();
@@ -1260,7 +1257,6 @@ async function renderAdmin(request, env) {
   const targetMap = {};
   for (const t of targetsResult.results) targetMap[t.id] = t;
 
-  // 内网/公网 WebRTC 分类辅助
   function isPrivate(ip) {
     if (!ip) return false;
     const s = String(ip).trim();
@@ -1290,7 +1286,7 @@ async function renderAdmin(request, env) {
     const cc = (r.country_code || "").toLowerCase();
     const flag = cc ? `<img src="https://ipdata.co/flags/${cc}.png" class="flag" style="width:16px;height:11px" alt="">` : "";
     const localBadge = isLocal ? '<span class="local-badge">本地</span>' : "";
-    const burnedBadge = Number(r.burned) === 1 ? '<span class="burned-badge">已删除</span>' : "";
+    const burnedBadge = Number(r.burned) === 1 ? '<span class="burned-badge">用户已删除</span>' : "";
 
     logRows += `<tr class="border-b border-slate-100 hover:bg-slate-50/70 align-top">
       <td class="p-2"><input type="checkbox" class="log-check" data-target-id="${esc(r.target_id)}"></td>
@@ -1314,7 +1310,6 @@ async function renderAdmin(request, env) {
   for (const [id, info] of Object.entries(targetMap)) {
     const creatorIp = info.creator_ip || "Unknown";
 
-    // 内网/公网分类展示 WebRTC 泄露 IP
     let webrtcHtml = "—";
     if (info.creator_webrtc_ips) {
       try {
@@ -1344,7 +1339,7 @@ async function renderAdmin(request, env) {
     if (info.creator_fingerprint) {
       try { const fp = JSON.parse(info.creator_fingerprint); if (fp && fp.visitorId) fpId = fp.visitorId.slice(0, 14) + "…"; } catch(e){}
     }
-    const typeLabel = info.image_type === "video" ? "视频" : (info.image_type === "image" ? "图片" : "像素");
+    const typeLabel = info.image_type === "video" ? "视频" : (info.image_type === "image" ? "图片" : "1x1像素");
 
     creatorRows += `<tr class="border-b border-slate-100 hover:bg-slate-50/70 align-top">
       <td class="p-2"><input type="checkbox" class="creator-check" data-creator-id="${esc(id)}"></td>
@@ -1390,9 +1385,10 @@ async function renderAdmin(request, env) {
   .flag{border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.18);vertical-align:-1px}
   table{border-collapse:collapse;width:100%}
   th{background:#f8fafc;font-size:11.5px;font-weight:700;color:#64748b;text-align:left;padding:9px 8px;white-space:nowrap}
-  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:90}
+  /* 关键修复：弹窗 z-index 高于 Leaflet 地图，避免地图遮挡弹窗 */
+  .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:9999}
   .modal.on{display:flex}
-  .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto}
+  .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto;position:relative;z-index:1}
   .dgrid{display:grid;grid-template-columns:1fr}
   @media(min-width:520px){.dgrid{grid-template-columns:1fr 1fr;gap:0 16px}}
   .drow{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px dashed #eef2f8;font-size:13px}
@@ -1418,8 +1414,8 @@ async function renderAdmin(request, env) {
   <div class="flex flex-wrap gap-3">
     <div class="stat"><div class="text-2xl font-bold text-indigo-600">${totalTargets ? totalTargets.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">追踪 ID 总数</div></div>
     <div class="stat"><div class="text-2xl font-bold text-emerald-600">${totalLogs ? totalLogs.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">总访问次数</div></div>
-    <div class="stat"><div class="text-2xl font-bold text-red-600">${totalBurned ? totalBurned.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">已删除（逻辑）</div></div>
-    <div class="stat"><div class="text-2xl font-bold text-amber-600">${uniqueIps ? uniqueIps.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">独立 IP（未删除）</div></div>
+    <div class="stat"><div class="text-2xl font-bold text-red-600">${totalBurned ? totalBurned.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">用户已删除</div></div>
+    <div class="stat"><div class="text-2xl font-bold text-amber-600">${uniqueIps ? uniqueIps.c : 0}</div><div class="text-[11.5px] text-slate-500 mt-1">独立 IP</div></div>
   </div>
 
   <div class="card p-4">
@@ -1454,7 +1450,7 @@ async function renderAdmin(request, env) {
       <table>
         <thead><tr>
           <th style="width:32px"><input type="checkbox" id="checkAllCreators"></th>
-          <th>ID</th><th>创建 IP</th><th>UA</th><th>WebRTC 泄露 IP（内网/公网）</th><th>指纹 ID</th><th>操作</th>
+          <th>ID</th><th>创建 IP</th><th>UA</th><th>WebRTC 泄露 IP</th><th>指纹 ID</th><th>操作</th>
         </tr></thead>
         <tbody>${creatorRows || '<tr><td colspan="7" class="p-6 text-center text-slate-400 text-[13px]">暂无数据</td></tr>'}</tbody>
       </table>
@@ -1465,7 +1461,7 @@ async function renderAdmin(request, env) {
     <div>Copyright © 2026 SAK All rights reserved.</div>
     <div class="break-words px-2">
       QQ:3344310554 · E-mail:cnzz666@163.com ·
-      <a href="https://b23.tv/8fCttY7" target="_blank" rel="noopener noreferrer" class="text-indigo-500">Bilibili:SAK _CN</a>
+      <a href="https://b23.tv/8fCttY7" target="_blank" rel="noopener noreferrer" class="text-indigo-500">Bilibili:SAK_CN</a>
     </div>
   </footer>
 </div>
