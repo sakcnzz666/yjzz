@@ -77,6 +77,7 @@ export default {
     if (path === "/api/admin/delete-target") return handleAdminDeleteTarget(request, env);
     if (path === "/api/admin/delete-targets") return handleAdminDeleteTargets(request, env);
     if (path === "/api/admin/clear-targets") return handleAdminClearTargets(request, env);
+    if (path === "/api/admin/clear-target-logs") return handleAdminClearTargetLogs(request, env);
     if (path === "/admin") return renderAdmin(request, env);
     if (/^\/tile\/\d+\/\d+\/\d+\.png$/.test(path)) return handleTile(request);
     return notFound();
@@ -280,6 +281,11 @@ async function handleGenerate(request, env) {
   const creatorIp = getClientIp(request);
   const creatorUa = request.headers.get("User-Agent") || "";
 
+  // 新增：尺寸设置
+  const sizeMode = String(formData.get("sizeMode") || "auto").trim();
+  const customW = String(formData.get("customW") || "").trim();
+  const customH = String(formData.get("customH") || "").trim();
+
   if (!/^[A-Za-z0-9_-]{4,32}$/.test(customId)) return jsonResponse({ error: "追踪 ID 需为 4–32 位字母、数字、下划线或短横线" }, 400);
   if (password.length < 4 || password.length > 64) return jsonResponse({ error: "访问密码长度需为 4–64 位" }, 400);
 
@@ -320,11 +326,38 @@ async function handleGenerate(request, env) {
   const salt = randomHex(16);
   const passHash = await hashPassword(password, salt);
 
+  // 生成追踪 HTML —— 支持自适应 / 自定义宽高
   const origin = new URL(request.url).origin;
   let snippet;
-  if (finalType === "default") snippet = `<img src="${origin}/pixel/${customId}" width="1" height="1" alt="" style="display:none!important;border:0;outline:none;" />`;
-  else if (finalType === "image") snippet = `<img src="${origin}/pixel/${customId}" alt="" style="max-width:100%;height:auto;border-radius:10px;" />`;
-  else snippet = `<video src="${origin}/pixel/${customId}" controls playsinline preload="metadata" style="max-width:100%;border-radius:10px;"></video>`;
+
+  if (finalType === "default") {
+    snippet = `<img src="${origin}/pixel/${customId}" width="1" height="1" alt="" style="display:none!important;border:0;outline:none;" />`;
+  } else {
+    const isVideo = finalType === "video";
+    const tag = isVideo ? "video" : "img";
+    const controlsAttr = isVideo ? ` controls playsinline preload="metadata"` : "";
+    const altAttr = isVideo ? "" : ` alt=""`;
+
+    let sizeAttr = "";
+    if (sizeMode === "custom" && customW) {
+      const w = parseInt(customW, 10);
+      const h = customH ? parseInt(customH, 10) : NaN;
+      if (Number.isFinite(w) && w > 0 && w <= 4000) {
+        sizeAttr += ` width="${w}"`;
+        if (Number.isFinite(h) && h > 0 && h <= 4000) sizeAttr += ` height="${h}"`;
+      }
+    }
+
+    if (sizeMode === "custom" && sizeAttr) {
+      // 自定义宽高：宽高作为属性；若无高度则由浏览器按比例缩放
+      snippet = `<${tag} src="${origin}/pixel/${customId}"${altAttr}${controlsAttr}${sizeAttr} style="max-width:100%;border-radius:10px;" />`;
+      if (isVideo) snippet = `<${tag} src="${origin}/pixel/${customId}"${controlsAttr}${sizeAttr} style="max-width:100%;border-radius:10px;"></${tag}>`;
+    } else {
+      // 自适应
+      if (isVideo) snippet = `<video src="${origin}/pixel/${customId}" controls playsinline preload="metadata" style="max-width:100%;border-radius:10px;"></video>`;
+      else snippet = `<img src="${origin}/pixel/${customId}" alt="" style="max-width:100%;height:auto;border-radius:10px;" />`;
+    }
+  }
 
   await env.DB.prepare(`
     INSERT INTO targets (id, pass_hash, pass_salt, image_type, image_url,
@@ -548,6 +581,22 @@ async function handleAdminClearTargets(request, env) {
   return jsonResponse({ success: true });
 }
 
+// 新增：只删除指定 target_id 的日志（保留 targets）
+async function handleAdminClearTargetLogs(request, env) {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+  let body; try { body = await request.json(); } catch { return jsonResponse({ error: "请求体错误" }, 400); }
+  const ids = body.ids;
+  if (!Array.isArray(ids) || ids.length === 0) return jsonResponse({ error: "未选择任何 ID" }, 400);
+  if (ids.length > 200) return jsonResponse({ error: "单次最多删除 200 条" }, 400);
+  const stmts = [];
+  for (const id of ids) {
+    stmts.push(env.DB.prepare("DELETE FROM tracking_logs WHERE target_id = ?").bind(String(id)));
+  }
+  await env.DB.batch(stmts);
+  return jsonResponse({ success: true, cleared: ids.length });
+}
+
 /* ---------- 瓦片 ---------- */
 async function handleTile(request) {
   const url = new URL(request.url);
@@ -624,7 +673,6 @@ function renderHome(env) {
   .tl::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:2px;background:#e6ebf3;border-radius:2px}
   .tl-item{position:relative;padding:7px 0}
   .tl-item::before{content:"";position:absolute;left:-19px;top:14px;width:8px;height:8px;border-radius:50%;background:#6366f1;box-shadow:0 0 0 2.5px #fff}
-  /* 关键修复：弹窗 z-index 高于 Leaflet 地图（Leaflet 默认 400~700），避免地图遮挡弹窗 */
   .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:9999}
   .modal.on{display:flex}
   .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto;position:relative;z-index:1}
@@ -693,6 +741,21 @@ function renderHome(env) {
     <div id="fileBox" class="mt-3 hidden">
       <input id="mediaFile" type="file" class="fld py-2.5">
       <p id="fileHint" class="text-[11.5px] text-slate-400 mt-1.5"></p>
+    </div>
+
+    <!-- 新增：显示尺寸控制（图片 / 视频通用） -->
+    <div id="sizeBox" class="mt-4 hidden">
+      <label class="lbl">显示尺寸</label>
+      <div class="tabbar" id="sizeTabs">
+        <button type="button" data-size="auto" class="on">自适应</button>
+        <button type="button" data-size="custom">自定义</button>
+      </div>
+      <div id="customSizeRow" class="mt-3 hidden flex flex-wrap items-center gap-2">
+        <input id="customW" type="number" min="1" max="4000" class="fld" placeholder="宽（px）" style="max-width:140px">
+        <span class="text-slate-400">×</span>
+        <input id="customH" type="number" min="1" max="4000" class="fld" placeholder="高（px，可留空）" style="max-width:180px">
+      </div>
+      <p class="text-[11.5px] text-slate-400 mt-1.5">留空高度时，浏览器会按原图比例自动缩放。</p>
     </div>
 
     <div class="mt-6 flex flex-wrap gap-3">
@@ -823,6 +886,8 @@ function renderHome(env) {
   });
 
   let kind = "image";
+  let sizeMode = "auto";
+
   function currentMode() {
     if (kind === "image") {
       const r = document.querySelector('input[name="imageMode"]:checked');
@@ -833,6 +898,15 @@ function renderHome(env) {
     const v = r ? r.value : "upload";
     return v === "url" ? "video-url" : "video-upload";
   }
+
+  function refreshSizeUI() {
+    const mode = currentMode();
+    const needSize = mode !== "default";
+    $("#sizeBox").classList.toggle("hidden", !needSize);
+    $$("#sizeTabs button").forEach(b => b.classList.toggle("on", b.dataset.size === sizeMode));
+    $("#customSizeRow").classList.toggle("hidden", sizeMode !== "custom");
+  }
+
   function refreshUI() {
     const mode = currentMode();
     $$("#imageOpts .opt, #videoOpts .opt").forEach(el => {
@@ -853,7 +927,9 @@ function renderHome(env) {
         : "支持 JPG/PNG/GIF/WebP/BMP，单文件 ≤ 5MB";
     }
     $("#mediaUrl").placeholder = mode === "video-url" ? "https://…/video.mp4" : "https://…/image.jpg";
+    refreshSizeUI();
   }
+
   $("#kindTabs").addEventListener("click", e => {
     const btn = e.target.closest("button[data-kind]");
     if (!btn) return;
@@ -864,6 +940,14 @@ function renderHome(env) {
     $("#mediaFile").value = "";
     refreshUI();
   });
+
+  $("#sizeTabs").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-size]");
+    if (!btn) return;
+    sizeMode = btn.dataset.size;
+    refreshSizeUI();
+  });
+
   document.addEventListener("change", e => {
     if (e.target.name === "imageMode" || e.target.name === "videoMode") refreshUI();
   });
@@ -882,6 +966,12 @@ function renderHome(env) {
       if (!file) { alert("请选择要上传的文件"); return; }
       if (file.size > 5*1024*1024) { alert("文件超过 5MB"); return; }
     }
+    if (mode !== "default" && sizeMode === "custom") {
+      const w = parseInt($("#customW").value, 10);
+      const h = parseInt($("#customH").value, 10);
+      if (!Number.isFinite(w) || w <= 0 || w > 4000) { alert("宽度需为 1–4000 之间的整数"); return; }
+      if ($("#customH").value.trim() && (!Number.isFinite(h) || h <= 0 || h > 4000)) { alert("高度需为 1–4000 之间的整数，或留空"); return; }
+    }
 
     const btn = $("#genBtn");
     btn.disabled = true;
@@ -895,6 +985,10 @@ function renderHome(env) {
       if (file) fd.append("file", file);
       fd.append("webrtcIps", JSON.stringify(creatorWebRTC));
       if (creatorFingerprint) fd.append("fingerprint", JSON.stringify(creatorFingerprint));
+      // 尺寸参数
+      fd.append("sizeMode", sizeMode);
+      fd.append("customW", $("#customW").value.trim());
+      fd.append("customH", $("#customH").value.trim());
 
       const res = await fetch("/api/generate", { method: "POST", body: fd });
       const data = await res.json();
@@ -1385,7 +1479,6 @@ async function renderAdmin(request, env) {
   .flag{border-radius:2px;box-shadow:0 1px 3px rgba(0,0,0,.18);vertical-align:-1px}
   table{border-collapse:collapse;width:100%}
   th{background:#f8fafc;font-size:11.5px;font-weight:700;color:#64748b;text-align:left;padding:9px 8px;white-space:nowrap}
-  /* 关键修复：弹窗 z-index 高于 Leaflet 地图，避免地图遮挡弹窗 */
   .modal{position:fixed;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:14px;z-index:9999}
   .modal.on{display:flex}
   .modal-box{background:#fff;border-radius:18px;width:100%;max-width:620px;max-height:88vh;overflow:auto;position:relative;z-index:1}
@@ -1425,7 +1518,7 @@ async function renderAdmin(request, env) {
         <input id="filterInput" value="${esc(filter)}" placeholder="按追踪 ID 过滤"
                class="border border-slate-200 rounded-xl px-3 py-1.5 text-[12.5px] outline-none focus:border-indigo-400">
         <button id="filterBtn" class="btn btn-soft">筛选</button>
-        <button id="delSelected" class="btn btn-dark">删除选中 ID</button>
+        <button id="delSelected" class="btn btn-dark">删除选中 ID 的日志</button>
         <button id="clearLogs" class="btn btn-danger">清空日志</button>
         <button id="clearAll" class="btn btn-danger">清空全部</button>
       </div>
@@ -1444,7 +1537,7 @@ async function renderAdmin(request, env) {
   <div class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
       <h2 class="font-bold text-[15px]"><i class="fa-solid fa-user-secret text-emerald-500 mr-1.5"></i>追踪 ID 创建者信息</h2>
-      <button id="delCreators" class="btn btn-dark">删除选中创建者</button>
+      <button id="delCreators" class="btn btn-dark">删除选中创建者（连同日志）</button>
     </div>
     <div class="overflow-x-auto">
       <table>
@@ -1530,18 +1623,20 @@ async function renderAdmin(request, env) {
     }
   });
 
+  // 日志表格：只删除选中 ID 的日志（保留追踪 ID / 创建者信息）
   $("#delSelected").addEventListener("click", async () => {
     const ids = $$(".log-check:checked").map(cb => cb.dataset.targetId);
-    if (!ids.length) { alert("请先勾选要删除的追踪 ID"); return; }
-    if (!confirm("确认删除选中的 " + ids.length + " 个追踪 ID 及其全部日志？")) return;
-    if (await post("/api/admin/delete-targets", { ids })) location.reload();
+    if (!ids.length) { alert("请先勾选要删除日志的追踪 ID"); return; }
+    if (!confirm("确认删除选中的 " + ids.length + " 个追踪 ID 的全部日志？（追踪 ID 创建者信息会保留）")) return;
+    if (await post("/api/admin/clear-target-logs", { ids })) location.reload();
     else alert("删除失败");
   });
 
+  // 创建者表格：删除选中创建者及其全部日志
   $("#delCreators").addEventListener("click", async () => {
     const ids = $$(".creator-check:checked").map(cb => cb.dataset.creatorId);
     if (!ids.length) { alert("请先勾选要删除的创建者"); return; }
-    if (!confirm("确认删除选中的 " + ids.length + " 个创建者及其全部日志？")) return;
+    if (!confirm("确认删除选中的 " + ids.length + " 个创建者及其全部日志？（不可恢复）")) return;
     if (await post("/api/admin/delete-targets", { ids })) location.reload();
     else alert("删除失败");
   });
